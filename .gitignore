@@ -3,3 +3,4 @@ cfd_data/*
 !cfd_data/.gitkeep
 src/checkpoints
 .venv
+src/logdir

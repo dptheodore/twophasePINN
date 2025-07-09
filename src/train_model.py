@@ -7,10 +7,9 @@ import pandas as pd
 import scipy.io
 import tensorflow as tf
 from tensorflow.keras import backend as K
-
 from generate_points import *
 from utilities import *
-from trainingLogger import TrainingLogger
+from logger import TrainingLogger
 np.random.seed(1234)
 tf.random.set_seed(1234)
 
@@ -45,6 +44,8 @@ class TwoPhasePinn:
         self.learning_rates = learning_rates
         self.epochs = epochs
         self.batch_sizes = batch_sizes
+
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rates[0])
 
         self.logger.log("Building Computational Graph")
 
@@ -413,7 +414,7 @@ class TwoPhasePinn:
         logger.addHandler(fh)
         return logger
 
-    @tf.function
+    @tf.function(jit_compile=True)
     def train_step(self, tf_dict):
         with tf.GradientTape() as tape:
             loss, batch_losses = self.compute_loss(tf_dict)
@@ -422,11 +423,75 @@ class TwoPhasePinn:
         return loss, batch_losses
 
 
+    def build_tf_dataset(self, df, columns, batch_size):
+        data = [tf.convert_to_tensor(df[c].values.reshape(-1,1), dtype=self.dtype) for c in columns]
+        dataset = tf.data.Dataset.from_tensor_slices(tuple(data))
+        dataset = dataset.shuffle(buffer_size=len(df), reshuffle_each_iteration=True)
+
+        dataset = dataset.cache()
+
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        return dataset
+
+    def zip_datasets(self, datasets):
+        keys = list(datasets.keys())
+        zipped = tf.data.Dataset.zip(tuple(datasets[k] for k in keys))
+        return zipped
+
+    def build_epoch_datasets(self, data_sets, batch_sizes):
+        datasets = {}
+        for key in self.placeholders:
+            datasets[key] = self.build_tf_dataset(
+                data_sets[key], 
+                self.placeholders[key], 
+                batch_sizes[key]
+            )
+        return datasets
+
+    @tf.function
+    def train_batch(self, batch, counter):
+        keys = list(self.placeholders.keys())
+        tf_dict = {'learning_rate': self.learning_rates[counter]}
+        for i, key in enumerate(keys):
+            tf_dict[key] = batch[i]
+        loss, batch_losses = self.train_step(tf_dict)
+        return loss, batch_losses
+
+    def preprocess_data(self, data_sets):
+        """Convert pandas DataFrames into dict of lists of tensors, one per column."""
+        tensor_data_sets = {}
+        for key in self.placeholders:
+            tensor_data_sets[key] = []
+            for col in self.placeholders[key]:
+                col_data = data_sets[key][col].values.reshape(-1,1)
+                tensor_data_sets[key].append(tf.convert_to_tensor(col_data, dtype=self.dtype))
+        return tensor_data_sets
+
+
+    def build_datasets(self, tensor_data_sets, batch_sizes):
+        """Build tf.data.Dataset objects, shuffled & batched, ready for training."""
+        datasets = {}
+        for key in self.placeholders:
+            data = tensor_data_sets[key]
+            dataset = tf.data.Dataset.from_tensor_slices(tuple(data))
+            dataset = dataset.shuffle(buffer_size=len(data[0]), reshuffle_each_iteration=True)
+            dataset = dataset.batch(batch_sizes[key])
+            dataset = dataset.prefetch(tf.data.AUTOTUNE)
+            datasets[key] = dataset
+        return datasets
+
+
+    def zip_datasets(self, datasets):
+        """Zip the individual datasets into a single dataset yielding batches of all."""
+        keys = list(self.placeholders.keys())
+        zipped = tf.data.Dataset.zip(tuple(datasets[k] for k in keys))
+        return zipped
+
 
     def train(self, data_sets):
         self.check_matching_keys(data_sets)
         self.print_point_distribution(data_sets)
-
         msg = (
             f"\n[bold green]EPOCHS:[/bold green] {self.epochs}\n"
             f"[bold blue]BATCH SIZES:[/bold blue] {self.batch_sizes}\n"
@@ -436,27 +501,37 @@ class TwoPhasePinn:
 
         start_total = time.time()
 
+        # Preprocess data once
+        tensor_data_sets = self.preprocess_data(data_sets)
         for counter, epoch_value in enumerate(self.epochs):
             self.current_learning_rate = self.learning_rates[counter]
-            self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.current_learning_rate)
-            batch_sizes, number_of_batches = self.get_batch_sizes(counter, data_sets)
+            self.optimizer.learning_rate.assign(self.learning_rates[counter])
+            batch_sizes, _ = self.get_batch_sizes(counter, data_sets)
+
+            # Build datasets once for this phase
+            datasets = self.build_datasets(tensor_data_sets, batch_sizes)
+            zipped_dataset = self.zip_datasets(datasets)
+
+            # Warm up @tf.function to avoid first-step lag
+            for batch in zipped_dataset.take(1):
+                _ = self.train_batch(batch, counter)
 
             for e in range(1, epoch_value + 1):
                 start_epoch = time.time()
-                data_sets = self.shuffle_data_and_reset_epoch_losses(data_sets)
+                self.epoch_loss = {k: 0.0 for k in self.loss_list}
 
-                for b in range(number_of_batches):
-                    batches = self.get_batches(data_sets, b, batch_sizes)
-                    tf_dict = self.get_feed_dict(batches, counter)
-
-                    loss, batch_losses = self.train_step(tf_dict)
-
+                num_batches = 0
+                for batch in zipped_dataset:
+                    loss, batch_losses = self.train_batch(batch, counter)
                     for i, key in enumerate(self.loss_list):
-                        self.epoch_loss[key] += batch_losses[i].numpy()  # accumulate as float
+                        self.epoch_loss[key] += batch_losses[i]  # tensor
+                    num_batches += 1
 
+                # average over batches
                 for key in self.loss_list:
-                    self.epoch_loss[key] /= number_of_batches
+                    self.epoch_loss[key] /= num_batches
 
+                # checkpoint & print
                 self.save_model_checkpoint(loss.numpy(), e, counter)
                 self.print_info(e, self.epochs[counter], time.time() - start_epoch)
 
@@ -516,14 +591,16 @@ if __name__ == "__main__":
 
     loss_weights_A = [1.0]
     loss_weights_PDE = [1.0, 10.0, 10.0, 1.0]
-    epochs = [5000]*5
-    number_of_batches = 20
+    epochs = [100]*5
+    number_of_batches = 10
     batch_sizes = [compute_batch_size(training_data, number_of_batches)]*5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
     checkpoint_interval = 2500
+    tf.config.optimizer.set_jit(True)
 
     PINN = TwoPhasePinn(dtype, hidden_layers, activation_functions, adaptive_activation_coeff, adaptive_activation_n, 
         adaptive_activation_init, use_ad_act, loss_weights_A, loss_weights_PDE, mu, sigma, g, rho, u_ref, L_ref, 
         checkpoint_interval, epochs, batch_sizes, learning_rates)
+
 
     PINN.train(training_data)
