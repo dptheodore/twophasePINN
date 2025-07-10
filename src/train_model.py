@@ -4,10 +4,10 @@ import tensorflow as tf
 import pandas as pd
 import math
 from generate_points import get_training_data
-
 # Reproducibility
 np.random.seed(1234)
 tf.random.set_seed(1234)
+print(tf.config.list_physical_devices("GPU"))
 
 # === Model ===
 
@@ -65,24 +65,41 @@ class TwoPhasePINNModel(tf.keras.Model):
         }
 
     def compute_gradients(self, x, y, t):
-        with tf.GradientTape(persistent=True) as tape2:
-            tape2.watch([x,y,t])
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch([x, y, t])
             inputs = {"x": x, "y": y, "t": t}
             out = self.call(inputs, training=True)
             u, v, p, a = out[:,0:1], out[:,1:2], out[:,2:3], out[:,3:4]
 
-        u_x = tape2.gradient(u, x); u_y = tape2.gradient(u, y); u_t = tape2.gradient(u, t)
-        v_x = tape2.gradient(v, x); v_y = tape2.gradient(v, y); v_t = tape2.gradient(v, t)
-        p_x = tape2.gradient(p, x); p_y = tape2.gradient(p, y)
-        a_x = tape2.gradient(a, x); a_y = tape2.gradient(a, y); a_t = tape2.gradient(a, t)
+            # first derivatives
+            u_x = tape.gradient(u, x)
+            u_y = tape.gradient(u, y)
+            u_t = tape.gradient(u, t)
 
-        # second derivatives
-        u_xx = tape2.gradient(u_x, x); u_yy = tape2.gradient(u_y, y)
-        v_xx = tape2.gradient(v_x, x); v_yy = tape2.gradient(v_y, y)
-        a_xx = tape2.gradient(a_x, x); a_yy = tape2.gradient(a_y, y)
-        a_xy = tape2.gradient(a_x, y)
+            v_x = tape.gradient(v, x)
+            v_y = tape.gradient(v, y)
+            v_t = tape.gradient(v, t)
 
-        del tape2
+            p_x = tape.gradient(p, x)
+            p_y = tape.gradient(p, y)
+
+            a_x = tape.gradient(a, x)
+            a_y = tape.gradient(a, y)
+            a_t = tape.gradient(a, t)
+
+            # second derivatives — note: computed *inside the same tape*
+            u_xx = tape.gradient(u_x, x)
+            u_yy = tape.gradient(u_y, y)
+
+            v_xx = tape.gradient(v_x, x)
+            v_yy = tape.gradient(v_y, y)
+
+            a_xx = tape.gradient(a_x, x)
+            a_yy = tape.gradient(a_y, y)
+            a_xy = tape.gradient(a_x, y)
+
+        del tape
+
         return (u, u_x, u_y, u_t, u_xx, u_yy,
                 v, v_x, v_y, v_t, v_xx, v_yy,
                 p, p_x, p_y,
@@ -176,13 +193,24 @@ if __name__ == "__main__":
     NOP_east = (20, 20)
     NOP_west = (20, 20)
 
+    tf.config.optimizer.set_jit(False)
+    tf.config.run_functions_eagerly(True)
+
     training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
+
+    #Starting physical values from paper
+    mu = [1.0, 10.0]
+    sigma = 24.5
+    g = -0.98
+    rho = [100, 1000]
+    U_ref = 1.0
+    L_ref = 0.25
 
     # Model
     hidden_layers = [400] * 8
     output_dim = 4  # u, v, p, a
     base_model = build_base_model(hidden_layers, output_dim)
-    model = TwoPhasePINNModel(base_model)
+    model = TwoPhasePINNModel(base_model, rho1=rho[0], rho2=rho[1], mu1=mu[0], mu2=mu[1], sigma=sigma, g=g, U_ref=U_ref, L_ref=L_ref)
 
     # Compile
     optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
@@ -196,12 +224,15 @@ if __name__ == "__main__":
 
     # Phased training
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
-    batch_sizes = [128, 64, 64, 32, 32]
+    batch_sizes = [9126, 9126, 9126, 9126, 9126]
     epochs_per_phase = 5000
 
     for phase, (lr, bs) in enumerate(zip(learning_rates, batch_sizes), start=1):
         print(f"\n=== Phase {phase}/5 | LR: {lr:.1e} | BS: {bs} ===\n")
-        model.optimizer.learning_rate.assign(lr)
+
+        # recompile with new optimizer to avoid .assign() issues
+        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+        model.compile(optimizer=optimizer)
 
         dataset = prepare_datasets(training_data, batch_size=bs)
 
