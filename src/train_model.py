@@ -4,12 +4,9 @@ import tensorflow as tf
 import pandas as pd
 import math
 from generate_points import get_training_data
-# Reproducibility
 np.random.seed(1234)
 tf.random.set_seed(1234)
 print(tf.config.list_physical_devices("GPU"))
-
-# === Model ===
 
 class TwoPhasePINNModel(tf.keras.Model):
     def __init__(self, base_model, rho1, rho2, mu1, mu2, sigma, g, U_ref, L_ref):
@@ -87,7 +84,7 @@ class TwoPhasePINNModel(tf.keras.Model):
             a_y = tape.gradient(a, y)
             a_t = tape.gradient(a, t)
 
-            # second derivatives — note: computed *inside the same tape*
+            # second derivatives
             u_xx = tape.gradient(u_x, x)
             u_yy = tape.gradient(u_y, y)
 
@@ -138,9 +135,6 @@ class TwoPhasePINNModel(tf.keras.Model):
 
         return PDE_m, PDE_u, PDE_v, PDE_a
 
-
-# === Utilities ===
-
 def build_base_model(hidden_layers, output_dim):
     inputs = tf.keras.Input(shape=(3,))
     x = inputs
@@ -182,10 +176,7 @@ def prepare_datasets(training_data, batch_size=128):
     return tf.data.Dataset.zip((ds_a, ds_pde, ds_nsew))
 
 
-# === Main ===
-
 if __name__ == "__main__":
-    # Data generation
     NOP_a = (500, 400)
     NOP_PDE = (400, 2000, 3000)
     NOP_north = (20, 20)
@@ -224,7 +215,7 @@ if __name__ == "__main__":
 
     # Phased training
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
-    batch_sizes = [9126, 9126, 9126, 9126, 9126]
+    batch_sizes = [9126, 9126, 9126, 9126, 9126] #i think this was the exact value the batch sizes were from the OG code
     epochs_per_phase = 5000
 
     for phase, (lr, bs) in enumerate(zip(learning_rates, batch_sizes), start=1):

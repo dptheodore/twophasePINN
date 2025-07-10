@@ -249,7 +249,7 @@ def get_training_data(NOP_A, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west):
         ax[0].set_aspect("equal")
         ax[1].set_aspect("equal")
         ax[2].set_aspect("equal")
-        #plt.show()
+        plt.show()
     
     print("Assembling data frames\n")
     data_EW = pd.DataFrame(data=np.hstack([data_east[:,0:2], data_west[:,0:3]]), columns=["x_E", "y_E", "x_W", "y_W", "t_EW"])
