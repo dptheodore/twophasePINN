@@ -12,9 +12,14 @@ tf.random.set_seed(1234)
 # === Model ===
 
 class TwoPhasePINNModel(tf.keras.Model):
-    def __init__(self, base_model):
+    def __init__(self, base_model, rho1, rho2, mu1, mu2, sigma, g, U_ref, L_ref):
         super().__init__()
         self.base_model = base_model
+        self.rho1, self.rho2 = rho1, rho2
+        self.mu1, self.mu2 = mu1, mu2
+        self.sigma, self.g = sigma, g
+        self.U_ref, self.L_ref = U_ref, L_ref
+        
 
     def call(self, inputs, training=False):
         x = tf.concat([inputs["x"], inputs["y"], inputs["t"]], axis=1)
@@ -28,15 +33,26 @@ class TwoPhasePINNModel(tf.keras.Model):
 
         with tf.GradientTape() as tape:
             pred_a = self({"x": x_a[:,0:1], "y": x_a[:,1:2], "t": x_a[:,2:3]}, training=True)
-            pred_pde = self({"x": x_pde[:,0:1], "y": x_pde[:,1:2], "t": x_pde[:,2:3]}, training=True)
             pred_nsew = self({"x": x_nsew[:,0:1], "y": x_nsew[:,1:2], "t": x_nsew[:,2:3]}, training=True)
 
-            # Dummy losses: adapt as needed
-            loss_a = tf.reduce_mean(tf.square(pred_a[:, 3:4] - y_a))
-            loss_pde = tf.reduce_mean(tf.square(pred_pde[:, 0:1] - y_pde))
-            loss_bc = tf.reduce_mean(tf.square(pred_nsew[:, 0:2] - y_nsew))
+            loss_a = tf.reduce_mean(tf.square(pred_a[:,3:4] - y_a))
+            loss_nsew = tf.reduce_mean(tf.square(pred_nsew[:,0:2] - y_nsew))
 
-            total_loss = loss_a + loss_pde + loss_bc
+            # PDE loss
+            PDE_m, PDE_u, PDE_v, PDE_a = self.pde_caller(
+                x_pde[:,0:1], x_pde[:,1:2], x_pde[:,2:3]
+            )
+
+            weights = tf.constant([1.0, 10.0, 10.0, 1.0], dtype=tf.float32)
+            pde_losses = tf.stack([
+                tf.reduce_mean(tf.square(PDE_m)),
+                tf.reduce_mean(tf.square(PDE_u)),
+                tf.reduce_mean(tf.square(PDE_v)),
+                tf.reduce_mean(tf.square(PDE_a))
+            ])
+            loss_pde = tf.tensordot(pde_losses, weights, axes=1)
+
+            total_loss = loss_a + loss_nsew + loss_pde
 
         grads = tape.gradient(total_loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
@@ -44,9 +60,66 @@ class TwoPhasePINNModel(tf.keras.Model):
         return {
             "loss": total_loss,
             "loss_a": loss_a,
-            "loss_pde": loss_pde,
-            "loss_bc": loss_bc,
+            "loss_nsew": loss_nsew,
+            "loss_pde": loss_pde
         }
+
+    def compute_gradients(self, x, y, t):
+        with tf.GradientTape(persistent=True) as tape2:
+            tape2.watch([x,y,t])
+            inputs = {"x": x, "y": y, "t": t}
+            out = self.call(inputs, training=True)
+            u, v, p, a = out[:,0:1], out[:,1:2], out[:,2:3], out[:,3:4]
+
+        u_x = tape2.gradient(u, x); u_y = tape2.gradient(u, y); u_t = tape2.gradient(u, t)
+        v_x = tape2.gradient(v, x); v_y = tape2.gradient(v, y); v_t = tape2.gradient(v, t)
+        p_x = tape2.gradient(p, x); p_y = tape2.gradient(p, y)
+        a_x = tape2.gradient(a, x); a_y = tape2.gradient(a, y); a_t = tape2.gradient(a, t)
+
+        # second derivatives
+        u_xx = tape2.gradient(u_x, x); u_yy = tape2.gradient(u_y, y)
+        v_xx = tape2.gradient(v_x, x); v_yy = tape2.gradient(v_y, y)
+        a_xx = tape2.gradient(a_x, x); a_yy = tape2.gradient(a_y, y)
+        a_xy = tape2.gradient(a_x, y)
+
+        del tape2
+        return (u, u_x, u_y, u_t, u_xx, u_yy,
+                v, v_x, v_y, v_t, v_xx, v_yy,
+                p, p_x, p_y,
+                a, a_x, a_y, a_t, a_xx, a_yy, a_xy)
+
+    def pde_caller(self, x, y, t):
+        (u, u_x, u_y, u_t, u_xx, u_yy,
+         v, v_x, v_y, v_t, v_xx, v_yy,
+         p, p_x, p_y,
+         a, a_x, a_y, a_t, a_xx, a_yy, a_xy) = self.compute_gradients(x, y, t)
+
+        mu = self.mu2 + (self.mu1 - self.mu2) * a
+        mu_x = (self.mu1 - self.mu2) * a_x
+        mu_y = (self.mu1 - self.mu2) * a_y
+        rho = self.rho2 + (self.rho1 - self.rho2) * a
+
+        abs_grad_a = tf.sqrt(a_x**2 + a_y**2 + 1e-12)
+        curvature = -((a_xx + a_yy)/abs_grad_a -
+                     (a_x**2*a_xx + a_y**2*a_yy + 2*a_x*a_y*a_xy)/(abs_grad_a**3))
+
+        rho_ref = self.rho2
+        one_Re = mu/(rho_ref*self.U_ref*self.L_ref)
+        one_Re_x = mu_x/(rho_ref*self.U_ref*self.L_ref)
+        one_Re_y = mu_y/(rho_ref*self.U_ref*self.L_ref)
+        one_We = self.sigma/(rho_ref*self.U_ref**2*self.L_ref)
+        one_Fr = self.g*self.L_ref/self.U_ref**2
+
+        PDE_m = u_x + v_y
+        PDE_a = a_t + u*a_x + v*a_y
+        PDE_u = (u_t + u*u_x + v*u_y)*rho/rho_ref + p_x \
+                - one_We*curvature*a_x - one_Re*(u_xx + u_yy) \
+                - 2.0*one_Re_x*u_x - one_Re_y*(u_y + v_x)
+        PDE_v = (v_t + u*v_x + v*v_y)*rho/rho_ref + p_y \
+                - one_We*curvature*a_y - rho/rho_ref*one_Fr \
+                - one_Re*(v_xx + v_yy) - 2.0*one_Re_y*v_y - one_Re_x*(u_y + v_x)
+
+        return PDE_m, PDE_u, PDE_v, PDE_a
 
 
 # === Utilities ===
