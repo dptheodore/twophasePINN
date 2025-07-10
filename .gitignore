@@ -4,3 +4,5 @@ cfd_data/*
 src/checkpoints
 .venv
 src/logdir
+src/logs
+src/*.keras
