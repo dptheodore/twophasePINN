@@ -26,14 +26,19 @@ class TwoPhasePINNModel(tf.keras.Model):
         (a_batch, pde_batch, nsew_batch) = data
         (x_a, y_a) = a_batch
         (x_pde, y_pde) = pde_batch
-        (x_nsew, y_nsew) = nsew_batch
+        (x_nsew, y_nsew) = nsew_batch 
 
         with tf.GradientTape() as tape:
             pred_a = self({"x": x_a[:,0:1], "y": x_a[:,1:2], "t": x_a[:,2:3]}, training=True)
             pred_nsew = self({"x": x_nsew[:,0:1], "y": x_nsew[:,1:2], "t": x_nsew[:,2:3]}, training=True)
 
-            loss_a = tf.reduce_mean(tf.square(pred_a[:,3:4] - y_a))
-            loss_nsew = tf.reduce_mean(tf.square(pred_nsew[:,0:2] - y_nsew))
+            print(y_a.shape)
+            print(pred_a.shape)
+            print(y_nsew.shape)
+            print(pred_nsew.shape)
+            loss_a = tf.losses.mean_squared_error(y_a, pred_a[:,3:4])
+
+            loss_nsew = tf.losses.mean_squared_error(y_nsew, pred_nsew[:,0:2])
 
             # PDE loss
             PDE_m, PDE_u, PDE_v, PDE_a = self.pde_caller(
@@ -41,13 +46,26 @@ class TwoPhasePINNModel(tf.keras.Model):
             )
 
             weights = tf.constant([1.0, 10.0, 10.0, 1.0], dtype=tf.float32)
+            
+            #compare PDE_m-a for this and master code
+            #add in the f_PDE as the predicted
+
+            y_pde = tf.transpose(y_pde)
+            PDE_m = tf.transpose(PDE_m)
+            PDE_u = tf.transpose(PDE_u)
+            PDE_v = tf.transpose(PDE_v)
+            PDE_a = tf.transpose(PDE_a)
             pde_losses = tf.stack([
-                tf.reduce_mean(tf.square(PDE_m)),
-                tf.reduce_mean(tf.square(PDE_u)),
-                tf.reduce_mean(tf.square(PDE_v)),
-                tf.reduce_mean(tf.square(PDE_a))
+                tf.losses.mean_squared_error(y_pde, PDE_m),
+                tf.losses.mean_squared_error(y_pde, PDE_u),
+                tf.losses.mean_squared_error(y_pde, PDE_v),
+                tf.losses.mean_squared_error(y_pde, PDE_a)
             ])
-            loss_pde = tf.tensordot(pde_losses, weights, axes=1)
+
+            print(pde_losses.shape)
+            loss_pde = pde_losses[0,0] * weights[0] + pde_losses[1,0] * weights[1] + pde_losses[2,0] * weights[2] + pde_losses[3,0] * weights[3]
+
+            #loss_pde = tf.tensordot(pde_losses, weights, axes=1)
 
             total_loss = loss_a + loss_nsew + loss_pde
 
