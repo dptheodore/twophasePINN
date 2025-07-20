@@ -4,9 +4,14 @@ import tensorflow as tf
 import pandas as pd
 import math
 from generate_points import get_training_data
+import random
+import logging
+random.seed(1234)
 np.random.seed(1234)
 tf.random.set_seed(1234)
-print(tf.config.list_physical_devices("GPU"))
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+tf.get_logger().setLevel(logging.ERROR)
+import time
 
 class TwoPhasePINNModel(tf.keras.Model):
     def __init__(self, base_model, rho1, rho2, mu1, mu2, sigma, g, U_ref, L_ref):
@@ -29,16 +34,13 @@ class TwoPhasePINNModel(tf.keras.Model):
         (x_nsew, y_nsew) = nsew_batch 
 
         with tf.GradientTape() as tape:
-            pred_a = self({"x": x_a[:,0:1], "y": x_a[:,1:2], "t": x_a[:,2:3]}, training=True)
+            output_tensors = self({"x": x_a[:,0:1], "y": x_a[:,1:2], "t": x_a[:,2:3]}, training=True)
             pred_nsew = self({"x": x_nsew[:,0:1], "y": x_nsew[:,1:2], "t": x_nsew[:,2:3]}, training=True)
 
-            print(y_a.shape)
-            print(pred_a.shape)
-            print(y_nsew.shape)
-            print(pred_nsew.shape)
-            loss_a = tf.losses.mean_squared_error(y_a, pred_a[:,3:4])
-
-            loss_nsew = tf.losses.mean_squared_error(y_nsew, pred_nsew[:,0:2])
+            mse = tf.keras.losses.MeanSquaredError()
+            #print(output_tensors[0][0])
+            loss_a = tf.reduce_mean(tf.square(y_a - output_tensors[3]))
+            loss_nsew = mse(y_nsew, pred_nsew[:,0:2])
 
             # PDE loss
             PDE_m, PDE_u, PDE_v, PDE_a = self.pde_caller(
@@ -55,19 +57,14 @@ class TwoPhasePINNModel(tf.keras.Model):
             PDE_u = tf.transpose(PDE_u)
             PDE_v = tf.transpose(PDE_v)
             PDE_a = tf.transpose(PDE_a)
-            pde_losses = tf.stack([
-                tf.losses.mean_squared_error(y_pde, PDE_m),
-                tf.losses.mean_squared_error(y_pde, PDE_u),
-                tf.losses.mean_squared_error(y_pde, PDE_v),
-                tf.losses.mean_squared_error(y_pde, PDE_a)
-            ])
+            loss_PDE_m = mse(y_pde, PDE_m)
+            loss_PDE_u = mse(y_pde, PDE_u)
+            loss_PDE_v = mse(y_pde, PDE_v)
+            loss_PDE_a = mse(y_pde, PDE_a)
 
-            print(pde_losses.shape)
-            loss_pde = pde_losses[0,0] * weights[0] + pde_losses[1,0] * weights[1] + pde_losses[2,0] * weights[2] + pde_losses[3,0] * weights[3]
+            loss_PDE = tf.tensordot(tf.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a]), np.array(weights), axes=1)
 
-            #loss_pde = tf.tensordot(pde_losses, weights, axes=1)
-
-            total_loss = loss_a + loss_nsew + loss_pde
+            total_loss = loss_a + loss_nsew + loss_PDE
 
         grads = tape.gradient(total_loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
@@ -76,7 +73,10 @@ class TwoPhasePINNModel(tf.keras.Model):
             "loss": total_loss,
             "loss_a": loss_a,
             "loss_nsew": loss_nsew,
-            "loss_pde": loss_pde
+            "m": loss_PDE_m,
+            "u": loss_PDE_u,
+            "v": loss_PDE_v,
+            "PDE_a": loss_PDE_a
         }
 
     def compute_gradients(self, x, y, t):
@@ -172,7 +172,7 @@ def df_to_dataset(df, feature_cols, target_cols, batch_size=128, shuffle=True):
     ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return ds
 
-def prepare_datasets(training_data, batch_size=128):
+def prepare_datasets(training_data, batch_size):
     ds_a = df_to_dataset(
         training_data['A'],
         feature_cols=['x_A', 'y_A', 't_A'],
@@ -216,7 +216,7 @@ if __name__ == "__main__":
     L_ref = 0.25
 
     # Model
-    hidden_layers = [400] * 8
+    hidden_layers = [350] * 8
     output_dim = 4  # u, v, p, a
     base_model = build_base_model(hidden_layers, output_dim)
     model = TwoPhasePINNModel(base_model, rho1=rho[0], rho2=rho[1], mu1=mu[0], mu2=mu[1], sigma=sigma, g=g, U_ref=U_ref, L_ref=L_ref)
@@ -233,7 +233,7 @@ if __name__ == "__main__":
 
     # Phased training
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
-    batch_sizes = [9126, 9126, 9126, 9126, 9126] #i think this was the exact value the batch sizes were from the OG code
+    batch_sizes = [9297, 9297, 9297, 9297, 9297] #i think this was the exact value the batch sizes were from the OG code
     epochs_per_phase = 5000
 
     for phase, (lr, bs) in enumerate(zip(learning_rates, batch_sizes), start=1):
@@ -245,9 +245,30 @@ if __name__ == "__main__":
 
         dataset = prepare_datasets(training_data, batch_size=bs)
 
-        model.fit(
-            dataset,
-            epochs=epochs_per_phase * phase,
-            initial_epoch=epochs_per_phase * (phase - 1),
-            callbacks=callbacks
-        )
+        epochs_this_phase = epochs_per_phase * phase
+        start_epoch = epochs_per_phase * (phase - 1)
+
+        for epoch in range(start_epoch + 1, epochs_this_phase + 1):
+            start_time = time.time()
+            dataset = prepare_datasets(training_data, batch_size=bs)
+            print(dataset)
+            epoch_losses = []
+            for step, (a_batch, pde_batch, nsew_batch) in enumerate(dataset):
+                batch_data = (a_batch, pde_batch, nsew_batch)
+                print(batch_data)
+                # call your `train_step()`, which already handles GradientTape
+                losses = model.train_step(batch_data)
+
+                epoch_losses.append(losses)
+
+                # if you want to inspect output_tensors_A (or equivalent), you need to modify `train_step()` to return it
+                # e.g. return losses, output_tensors_A
+
+            # optionally log/aggregate losses here
+            avg_loss = np.mean([l['loss'] for l in epoch_losses])
+
+            # checkpoint if desired
+            if epoch % 100 == 0:
+                model.save_weights(f"checkpoint_phase{phase}_epoch{epoch}.h5")
+
+            print(f"Epoch {epoch}/{epochs_this_phase} — Loss: {avg_loss:.6f} — Time: {time.time() - start_time:.2f}s")
