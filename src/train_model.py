@@ -161,7 +161,7 @@ def build_base_model(hidden_layers, output_dim):
     outputs = tf.keras.layers.Dense(output_dim)(x)
     return tf.keras.Model(inputs, outputs)
 
-def df_to_dataset(df, feature_cols, target_cols, batch_size=128, shuffle=True):
+def df_to_dataset(df, feature_cols, target_cols, batch_size, shuffle=True):
     x = df[feature_cols].values.astype('float32')
     y = df[target_cols].values.astype('float32')
     if y.ndim == 1:

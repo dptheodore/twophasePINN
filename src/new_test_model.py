@@ -11,23 +11,27 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 
-def compute_mae_over_time(cfd_data, nn_data):
+def compute_mae_over_time(cfd_data, nn_data, t):
     """
-    Compute mean absolute error over time.
-    cfd_data, nn_data: arrays of shape [ny, nx, nt]
-    returns: array of shape [nt]
+    Compute MAE at each time point. 
+    Assumes cfd_data, nn_data: shape [nt, ny, nx]
+    and t has shape [nt]
     """
-    ny, nx, nt = cfd_data.shape
+    nt, ny, nx = cfd_data.shape
     mae = np.zeros(nt)
+    l1_norm = np.zeros(nt)
+    l2_norm = np.zeros(nt)
     for i in range(nt):
-        mae[i] = np.mean(np.abs(cfd_data[:, :, i] - nn_data[:, :, i]))
-    return mae
+        mae[i] = np.mean(np.abs(cfd_data[i, :, :] - nn_data[i, :, :]))
+        l1_norm[i] = np.sum(np.abs(cfd_data[i] - nn_data[i])) / (ny * nx)
+        diff = cfd_data[i] - nn_data[i]
+        l2_norm[i] = np.sqrt(np.sum(diff**2) / (ny * nx))
+    return mae, l1_norm, l2_norm
 
 def plot_mae_and_norms_scaled(t, cfd_data, nn_data, var_names):
     """
     Plot MAE (red, left y-axis) and Norms (blue, right y-axis) over time.
-    MAE scale: 0 to 0.15
-    Norms scale: 0 to 0.06
+    Assumes cfd_data, nn_data: list of arrays with shape [nt, ny, nx]
     """
     n_vars = len(var_names)
     fig, axes = plt.subplots(n_vars, 1, figsize=(8, 4*n_vars), sharex=True)
@@ -36,29 +40,28 @@ def plot_mae_and_norms_scaled(t, cfd_data, nn_data, var_names):
         axes = [axes]
 
     for i, (cfd, nn, name, ax) in enumerate(zip(cfd_data, nn_data, var_names, axes)):
-        mae = compute_mae_over_time(cfd, nn)
-        norm = np.linalg.norm(cfd.reshape(-1, cfd.shape[-1]), axis=0) / np.prod(cfd.shape[:2])
+        mae, l1_norm, l2_norm = compute_mae_over_time(cfd, nn, t)
 
-        # adjust time array if needed
-        if mae.shape[0] != t.shape[0]:
-            t_resized = np.linspace(t[0], t[-1], mae.shape[0])
-        else:
-            t_resized = t
-
-        # Left axis (red) for MAE
-        ax.plot(t_resized, mae, 'r-', label=f'{name} MAE')
+        ax.plot(t, mae, 'r-', label=f'{name} MAE')
         ax.set_ylabel(f'{name} MAE', color='red')
         ax.tick_params(axis='y', labelcolor='red')
-        ax.set_ylim(0, 0.15)
+        #ax.set_ylim(0, 0.15)
 
-        # Right axis (blue) for Norm
+        # Right axis (blue) for L1 and L2 norms
         ax2 = ax.twinx()
-        ax2.plot(t_resized, norm, 'b-', label=f'{name} Norm')
-        ax2.set_ylabel(f'{name} Norm', color='blue')
+        ax2.plot(t, l1_norm, 'b-', label=f'{name} L1 Norm')    # Solid blue line
+        ax2.plot(t, l2_norm, 'b--', label=f'{name} L2 Norm')   # Dotted blue line
+        ax2.set_ylabel(f'{name} Norms', color='blue')
         ax2.tick_params(axis='y', labelcolor='blue')
-        ax2.set_ylim(0, 0.06)
+        #ax2.set_ylim(0, 0.06)
 
         ax.grid(True)
+        ax.set_xticks([0, 5, 10])
+
+        # Combine legends from both axes
+        lines_1, labels_1 = ax.get_legend_handles_labels()
+        lines_2, labels_2 = ax2.get_legend_handles_labels()
+        ax.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper right')
 
     axes[-1].set_xlabel("Time")
     plt.suptitle("MAE (red, 0–0.15) and Norms (blue, 0–0.06) over Time", fontsize=14)
@@ -108,7 +111,7 @@ def main():
 
     # PREPARE PREDICTION DATA (x, y, t are numeric arrays here!)
     test_data = reshape_test_data(x, y, t)
-
+    print(t)
     # PREDICT AND RESHAPE SOLUTION
     print("\nPredicting nn solution")
     velocityX_nn, velocityY_nn, pressure_nn, volume_fraction_nn = model.predict(
@@ -116,6 +119,7 @@ def main():
     )
 
     velocityX_nn = reshape_prediction(x, y, t, velocityX_nn)
+    print(velocityX_nn)
     velocityY_nn = reshape_prediction(x, y, t, velocityY_nn)
     pressure_nn = reshape_prediction(x, y, t, pressure_nn)
     volume_fraction_nn = reshape_prediction(x, y, t, volume_fraction_nn)
@@ -137,18 +141,6 @@ def main():
     # )
 
     # #plt.show()
-
-    mae_u = compute_mae_over_time(velocityX_cfd, velocityX_nn)
-    mae_v = compute_mae_over_time(velocityY_cfd, velocityY_nn)
-    mae_p = compute_mae_over_time(pressure_cfd, pressure_nn)
-
-    print(f"t.shape: {t.shape}, mae_u.shape: {mae_u.shape}")
-
-    if mae_u.shape[0] != t.shape[0]:
-        # adjust time array to match MAE length
-        t_resized = np.linspace(t[0], t[-1], mae_u.shape[0])
-    else:
-        t_resized = t
 
     cfd_list = [velocityX_cfd, velocityY_cfd, pressure_cfd]
     nn_list  = [velocityX_nn, velocityY_nn, pressure_nn]

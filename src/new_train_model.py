@@ -292,7 +292,7 @@ def main():
 
     # --- NN Architecture and Hyperparameters (no changes here) ---
     no_layers = 8
-    hidden_layers = [350] * no_layers
+    hidden_layers = [400] * no_layers
     activation_functions = {'tanh': range(1, no_layers + 1)}
     adaptive_activation_coeff = {"aac_1": range(1, no_layers + 1)}
     adaptive_activation_init = {"aac_1": 0.1}

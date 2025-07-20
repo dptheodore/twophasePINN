@@ -31,6 +31,7 @@ def main():
 
     # PREPARE PREDICTION DATA - WE COMPUTE THE PREDICTION AT THE SAME SPATIAL/TEMPORAL COORDS WHERE THE CFD SOLUTION IS PROVIDED 
     test_data = reshape_test_data(x, y, t)
+    print(test_data)
 
     # PREDICT AND RESHAPE SOLUTION
     print("\nPredicting nn solution") 
