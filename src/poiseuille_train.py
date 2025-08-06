@@ -12,7 +12,7 @@ DTYPE = 'float32'
 tf.keras.backend.set_floatx(DTYPE)
 
 # --- Configuration (CHANGE THESE BASED ON WHAT YOU WANT TO PLOT)---
-mu1 = 4.0
+mu1 = 6.0
 USE_ADAPTIVE_ACTIVATION = False
 tf.random.set_seed(1234)
 w_ic, w_bc, w_f = 1.0, 1.0, 1.0 # According to paper, these are a flat 1.0, we can tweak these in the future
@@ -390,10 +390,14 @@ def train_step(model, optimizer, data, w_ic, w_bc, w_f):
 if __name__ == "__main__":    
     ACTIVATION_TYPE = "adaptive" if USE_ADAPTIVE_ACTIVATION else "fixed"
     BASE_SAVE_DIR = Path("./pinn_output")
-    # Create a subfolder for mu1, then for the activation type
-    run_save_dir = BASE_SAVE_DIR / f"mu1_{mu1}" / ACTIVATION_TYPE
+
+    # --- NEW: Generate a timestamp for the run ---
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    
+    run_save_dir = BASE_SAVE_DIR / f"mu1_{mu1}" / ACTIVATION_TYPE / timestamp
+    
     run_save_dir.mkdir(parents=True, exist_ok=True)
-    print(f"All outputs will be saved to: {run_save_dir}")
+    print(f"All outputs for this run will be saved to: {run_save_dir}")
 
     # --- Model and Data Setup ---
     pinn_model = PINN(use_adaptive_activation=USE_ADAPTIVE_ACTIVATION)
@@ -447,10 +451,10 @@ if __name__ == "__main__":
                 else:
                     print(f"Epoch: {total_epochs:05d}, Loss: {total_loss:.4e}, IC: {loss_ic:.4e}, BC: {loss_bc:.4e}, PDE: {loss_f:.4e}, MSE: {current_mse:.4e}")
                 
-                # --- NEW: Scoped Model Saving ---
+                # --- Scoped Model Saving (Works as intended with new directory structure) ---
                 if current_mse < best_mse:
                     # 1. First, remove all old weight files in this specific run's directory
-                    # The pattern looks for 'best_pinn_model_*.weights.h5' inside run_save_dir
+                    # The pattern now correctly looks only inside the timestamped `run_save_dir`
                     cleanup_pattern = str(run_save_dir / f"{best_model_basename}_*.weights.h5")
                     for f_path in glob.glob(cleanup_pattern):
                         os.remove(f_path)
@@ -460,7 +464,7 @@ if __name__ == "__main__":
                     best_weights_filename = f"{best_model_basename}_{best_mse:.4e}.weights.h5"
                     best_weights_file_path = str(run_save_dir / best_weights_filename) # Update the global tracker
                     
-                    print(f"    >>> New best MSE: {best_mse:.4e}. Saving model to {best_weights_file_path}")
+                    print(f"     >>> New best MSE: {best_mse:.4e}. Saving model to {best_weights_file_path}")
                     pinn_model.save_weights(best_weights_file_path)
 
     print(f"\nTraining finished in {time.time() - start_time:.2f} seconds.")
