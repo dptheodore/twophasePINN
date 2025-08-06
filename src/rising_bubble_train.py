@@ -13,9 +13,6 @@ import numpy as np
 import pandas as pd
 import scipy.io
 from generate_points import get_training_data
-# The 'utilities' module from the original script is not fully provided.
-# A placeholder class for NNCreator and a function for writeToJSONFile are added.
-# You will need to ensure the actual 'utilities' module is available and compatible.
 from utilities import NNCreator, writeToJSONFile 
 import time
 import math

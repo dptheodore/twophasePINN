@@ -6,3 +6,6 @@ src/checkpoints
 src/logdir
 src/logs
 src/*.keras
+typings/*
+pyrightconfig.json
+src/pinn_output/*
