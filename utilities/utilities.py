@@ -5,7 +5,6 @@ from mpl_toolkits.axes_grid1 import ImageGrid
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-mpl.rcParams["mpl_toolkits.legacy_colorbar"] = False
 import h5py
 import json
 import mat4py

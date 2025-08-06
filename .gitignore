@@ -3,3 +3,9 @@ cfd_data/*
 !cfd_data/.gitkeep
 src/checkpoints
 .venv
+src/logdir
+src/logs
+src/*.keras
+typings/*
+pyrightconfig.json
+src/pinn_output/*
