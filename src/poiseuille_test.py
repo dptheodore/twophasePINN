@@ -12,7 +12,7 @@ DTYPE = 'float32'
 tf.keras.backend.set_floatx(DTYPE)
 
 # --- Configuration (CHANGE THESE BASED ON WHAT YOU WANT TO PLOT)---
-mu1 = 2.0
+mu1 = 6.0
 USE_ADAPTIVE_ACTIVATION = False
 # ---------------------
 
@@ -73,33 +73,53 @@ def find_best_model_across_runs(directory: Path) -> str | None:
     
     if best_file_path:
         print(f"Found best model across all runs with MSE: {min_mse:.4e}")
-
+    print(best_file_path)
     return best_file_path
 
 # =============================================================================
 # 2. NEURAL NETWORK MODEL AND HELPER FUNCTIONS
 # =============================================================================
 class PINN(tf.keras.Model):
+    """
+    PINN model using adaptive activation with the softplus function.
+    Now with specific activation functions for each physical output.
+    """
     def __init__(self, use_adaptive_activation=True, **kwargs):
         super().__init__(**kwargs)
         self.use_adaptive_activation = use_adaptive_activation
         initializer = tf.keras.initializers.GlorotNormal()
         n_hidden_layers = 10
         n_neurons = 100
+        
+        # Hidden layers
         self.hidden_layers = [
             tf.keras.layers.Dense(n_neurons, activation=None, kernel_initializer=initializer, bias_initializer='zeros')
             for _ in range(n_hidden_layers)
         ]
+        
+        # --- MULTI-OUTPUT LAYERS WITH SPECIFIC ACTIVATIONS ---
+        # Output layer for u velocity, with linear activation (unbounded)
         self.u_output_layer = tf.keras.layers.Dense(1, activation='linear', kernel_initializer=initializer, bias_initializer='zeros')
+        
+        # Output layer for p pressure, with exponential activation (P >= 0)
         self.p_output_layer = tf.keras.layers.Dense(1, activation='exponential', kernel_initializer=initializer, bias_initializer='zeros')
+        
+        # Output layer for alpha volume fraction, with sigmoid activation (0 <= alpha <= 1)
         self.alpha_output_layer = tf.keras.layers.Dense(1, activation='sigmoid', kernel_initializer=initializer, bias_initializer='zeros')
+
         if self.use_adaptive_activation:
             self.n = tf.constant(10.0, dtype=DTYPE)
             self.a_s = []
             initial_a_value = 0.1
             a_initializer = tf.keras.initializers.Constant(initial_a_value)
+
             for i in range(n_hidden_layers):
-                a = self.add_weight(name=f'a_{i}', shape=(n_neurons,), initializer=a_initializer, trainable=True)
+                a = self.add_weight(
+                    name=f'a_{i}',
+                    shape=(n_neurons,),  #One per neuron
+                    initializer=a_initializer,
+                    trainable=True
+                )
                 self.a_s.append(a)
 
     def call(self, inputs):
@@ -111,9 +131,13 @@ class PINN(tf.keras.Model):
                 x = tf.tanh(self.n * a * x)
             else:
                 x = tf.tanh(x)
+        
+        # Get outputs from the specific output layers
         u = self.u_output_layer(x)
         p = self.p_output_layer(x)
         alpha = self.alpha_output_layer(x)
+        
+        # Return all three outputs as separate tensors
         return u, p, alpha
 
 def analytical_solution(y, mu_1, mu_2, pressure_drop):
@@ -142,51 +166,42 @@ print(f"Loading best model: {Path(best_model_path).name}\n")
 
 # Instantiate and build the model before loading weights
 pinn_model = PINN(use_adaptive_activation=USE_ADAPTIVE_ACTIVATION)
-pinn_model.build(input_shape=(None, 3)) 
+dummy_input = tf.zeros((1, 3), dtype=DTYPE)
+_ = pinn_model(dummy_input)
 pinn_model.load_weights(best_model_path)
-
+print(best_model_path)
 print("Generating verification plot...")
 # Evaluation line: x = 0, t = t_max, y ∈ [y_min, y_max]
 N_plot = 100
 y_plot = np.linspace(y_min, y_max, N_plot).astype(DTYPE)
-t_plot = np.full_like(y_plot, t_max, dtype=DTYPE)
-x_plot = np.zeros_like(y_plot, dtype=DTYPE)
-
-# Model prediction at (t_max, x=0, y)
-inputs = tf.convert_to_tensor(np.stack([t_plot, x_plot, y_plot], axis=1))
-u_pred, _, _ = pinn_model(inputs)
+t_plot = np.ones_like(y_plot) * t_max
+x_plot = np.zeros_like(y_plot)
+u_pred, _, _ = pinn_model(tf.concat([t_plot[:,None], x_plot[:,None], y_plot[:,None]], axis=1))
 u_pred = u_pred.numpy().flatten()
-
-# Analytical steady-state solution
 u_exact = analytical_solution(y_plot, mu1, mu2, -dp_dx)
 
-# Normalize both profiles by the mean of the *exact* solution for consistent comparison
-mean_u_exact = np.mean(u_exact)
-u_pred_norm = u_pred / mean_u_exact
-u_exact_norm = u_exact / mean_u_exact
+u_pred_norm = u_pred / np.mean(u_pred) if np.mean(u_pred) != 0 else u_pred
+u_exact_norm = u_exact / np.mean(u_exact) if np.mean(u_exact) != 0 else u_exact
 
 # --- Calculate and Print Errors ---
 MSE = mean_squared_error(u_exact_norm, u_pred_norm)
 L1_rel = np.mean(np.abs(u_pred_norm - u_exact_norm)) / np.mean(np.abs(u_exact_norm))
 L2_rel = np.linalg.norm(u_pred_norm - u_exact_norm) / np.linalg.norm(u_exact_norm)
 
-print(f"--- Steady-State Error Metrics (Normalized by mean of u_exact) ---")
+print(f"--- Steady-State Error Metrics ---")
 print(f"MSE: {MSE:.3e}")
 print(f"L1 relative error: {L1_rel:.3e}")
 print(f"L2 relative error: {L2_rel:.3e}")
-print(f"Mean of u_exact: {mean_u_exact:.4f}, Mean of u_pred: {np.mean(u_pred):.4f}")
 
 # --- Create and Save the Plot ---
 plt.figure(figsize=(7, 6))
 # Plot analytical solution as a dashed line
-plt.plot(u_exact_norm, y_plot, 'b--', label='Analytical Solution', linewidth=2.5)
-# Plot PINN prediction as a solid line
-plt.plot(u_pred_norm, y_plot, 'r-', label='PINN Prediction (Line)', linewidth=2)
+plt.plot(u_pred_norm, y_plot, 'b-', label='Predicted Solution', linewidth=2)
 
 # Plot PINN prediction as discrete points for emphasis
 num_points = 20
 indices = np.linspace(0, len(y_plot) - 1, num_points, dtype=int)
-plt.plot(u_pred_norm[indices], y_plot[indices], 'o', color='red', markerfacecolor='none', markersize=8, markeredgewidth=1.5, label='PINN Prediction (Points)')
+plt.plot(u_exact_norm[indices], y_plot[indices], 'o', color='red', markerfacecolor='none', markersize=8, markeredgewidth=1.5, label='PINN Analytical (Points)')
 
 plt.axhline(0, color='k', linestyle=':', label='Interface')
 plt.ylim(y_min - 0.05, y_max + 0.05)
