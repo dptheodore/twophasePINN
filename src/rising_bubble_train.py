@@ -1,6 +1,4 @@
 import sys
-# Assuming 'utilities' and 'generate_points' are in this path
-# You might need to adjust this path based on your project structure.
 sys.path.append("../utilities")
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -20,6 +18,15 @@ import glob
 from datetime import datetime
 import shutil
 import logging
+import matplotlib.pyplot as plt
+import tensorflow.keras.backend as K
+from tensorflow.keras.utils import get_custom_objects
+
+# Define and register the custom sine activation function so Keras can find it by name
+def sine_activation(x):
+    return K.sin(x)
+get_custom_objects().update({'sine': sine_activation})
+
 
 # Set random seeds for reproducibility
 np.random.seed(1234)
@@ -176,7 +183,6 @@ class TwoPhasePinn(tf.keras.Model):
         # Loss A (Volume Fraction)
         output_tensors = self.call(tf.concat([x_A, y_A, t_A], axis=1))
         loss_a_A = tf.reduce_mean(tf.square(a_A - output_tensors[3]))
-        #tf.print(loss_a_A)
 
         # Loss NSEW (Boundary Conditions)
         pred_u_NSEW, pred_v_NSEW, _, _ = self.call(tf.concat([x_NSEW, y_NSEW, t_NSEW], axis=1))
@@ -230,7 +236,6 @@ def setup_output_directory():
     dirname = os.path.abspath(os.path.join("checkpoints", datetime.now().strftime("%b-%d-%Y_%H-%M-%S")))
     os.mkdir(dirname)
     
-    # Copy essential files for reproducibility
     shutil.copyfile(__file__, os.path.join(dirname, os.path.basename(__file__)))
     if os.path.exists("generate_points.py"):
         shutil.copyfile("generate_points.py", os.path.join(dirname, "generate_points.py"))
@@ -242,12 +247,10 @@ def get_logger(logpath):
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
     
-    # StreamHandler for console output
     sh = logging.StreamHandler()
     sh.setFormatter(logging.Formatter('%(message)s'))
     logger.addHandler(sh)
     
-    # FileHandler for logging to a file
     fh = logging.FileHandler(logpath)
     fh.setFormatter(logging.Formatter('%(message)s'))
     logger.addHandler(fh)
@@ -278,7 +281,6 @@ def main():
     dirname, logpath = setup_output_directory()
     logger = get_logger(logpath)
 
-    # --- Parameters and Data Loading (no changes here) ---
     NOP_a = (500, 400)
     NOP_PDE = (400, 2000, 3000)
     NOP_north = (20, 20)
@@ -287,14 +289,49 @@ def main():
     NOP_west = (20, 20)
     training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
 
-    # --- NN Architecture and Hyperparameters (no changes here) ---
+    # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
     hidden_layers = [400] * no_layers
-    activation_functions = {'tanh': range(1, no_layers + 1)}
-    adaptive_activation_coeff = {"aac_1": range(1, no_layers + 1)}
-    adaptive_activation_init = {"aac_1": 0.1}
-    adaptive_activation_n = [10] * no_layers
-    use_ad_act = False
+
+    # --- CHOOSE YOUR CONFIGURATION ---
+    activation_choice = 'tanh'  # Options: 'tanh' or 'sine'
+    use_aac_1 = False
+    use_aac_2 = True #If you declare both false, fixed/no activation is used
+
+    # Build activation function dictionary based on choice
+    activation_functions = {activation_choice: range(1, no_layers + 1)}
+
+    # Determine adaptive activation mode for file naming and logic
+    adaptive_mode = 'fixed'
+    if use_aac_1:
+        adaptive_mode = 'activation1'
+    elif use_aac_2:
+        adaptive_mode = 'activation2'
+    
+    logger.info(f"Configuration: Activation='{activation_choice}', Mode='{adaptive_mode}'")
+    
+    # Conditionally define the adaptive activation parameters
+    if use_aac_1:
+        adaptive_activation_coeff = {"aac_1": range(1, no_layers + 1)}
+        adaptive_activation_init = {"aac_1": 0.1}
+        adaptive_activation_n = [10] * no_layers
+    elif use_aac_2:
+        adaptive_activation_coeff = {
+            "aac_2_a": range(1, 5),
+            "aac_2_b": range(5, 9)
+        }
+        adaptive_activation_init = {
+            "aac_2_a": 0.05,
+            "aac_2_b": 0.1
+        }
+        adaptive_activation_n = [20] * 4 + [10] * 4
+    else: # 'fixed' mode
+        adaptive_activation_coeff = {}
+        adaptive_activation_init = {}
+        adaptive_activation_n = [10] * no_layers
+
+    use_adaptive_activation = use_aac_1 or use_aac_2
+    
     mu = [1.0, 10.0]
     sigma = 24.5
     g = -0.98
@@ -306,31 +343,23 @@ def main():
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
     checkpoint_interval = 100
     num_of_batches = 20
-    # --- Set Total Batch Size ---
-    # The original script used 20 batches. We calculate the equivalent total batch size.
+    
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches) 
 
-    # --- Instantiate PINN (no changes here) ---
     pinn = TwoPhasePinn(hidden_layers, activation_functions, adaptive_activation_coeff,
-                      adaptive_activation_n, adaptive_activation_init, use_ad_act,
+                      adaptive_activation_n, adaptive_activation_init, use_adaptive_activation,
                       loss_weights_PDE, mu, sigma, g, rho, u_ref, L_ref)
 
     pinn.nn.load_weights('initial_weights.h5')
 
-    # first_layer_weights = pinn.nn.layers[1].get_weights()[0]
-    # print("TF2 First Layer Weights (slice):\n", first_layer_weights[:2, :2])
-    # Comment above out to verify same weights as paper should be:
-    # TF2 First Layer Weights (slice):
-    #    [[-0.09551109 -0.03110073]
-    #    [-0.08348112  0.0810886 ]]
-
-
-    # --- REVISED TRAINING LOOP WITH MINI-BATCHING ---
     start_total = time.time()
     epoch_loss_checkpoints = 1e10
     
-    # Helper for converting a DataFrame batch to tensors
+    history_loss_a = []
+    history_loss_f_uv = []
+    history_loss_f_ma = []
+    
     def to_tensor_tuple(df, columns):
         return tuple(tf.constant(df[c].to_numpy().reshape(-1, 1), dtype=tf.float32) for c in columns)
 
@@ -339,52 +368,43 @@ def main():
         logger.info(f"\n--- Starting Training Phase {i+1}/{len(epochs_list)} ---")
         logger.info(f"Epochs: {epochs}, Learning Rate: {lr}")
         optimizer.learning_rate.assign(lr)
-        # Get proportional batch sizes for this training phase
         prop_batch_sizes, num_batches = get_proportional_batch_sizes(total_batch_size, training_data, logger)
-        start_epoch = time.time()
+        
         for epoch in range(1, epochs + 1):
+            start_epoch_time = time.time()
             epoch_losses = []
-
-            # Shuffle data at the beginning of each epoch
             shuffled_data = {key: df.sample(frac=1) for key, df in training_data.items()}
 
             for b in range(num_batches):
-                # Create the mini-batch for each data type
                 batch_dict = {}
                 for key, df in shuffled_data.items():
                     start_idx = b * prop_batch_sizes[key]
                     end_idx = (b + 1) * prop_batch_sizes[key]
                     batch_dict[key] = df.iloc[start_idx:end_idx]
 
-                # Skip empty batches
                 if all(batch.empty for batch in batch_dict.values()):
                     continue
 
-                # Convert the mini-batch DataFrames to tensors
                 data_A = to_tensor_tuple(batch_dict['A'], batch_dict['A'].columns)
                 data_PDE = to_tensor_tuple(batch_dict['PDE'], ['x_PDE', 'y_PDE', 't_PDE'])
                 data_N = to_tensor_tuple(batch_dict['N'], batch_dict['N'].columns)
                 data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
                 data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
                 
-                tensor_data_tuple = (data_A, data_PDE, data_N, data_EW, data_NSEW)
-                
-                # Perform one training step on the mini-batch
-                batch_loss_values = pinn.train_step(optimizer, *tensor_data_tuple)
+                batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW)
                 epoch_losses.append([l.numpy() for l in batch_loss_values])
 
-            # Calculate average loss for the epoch
-            avg_losses = np.sum(epoch_losses, axis=0)
+            avg_losses = np.mean(epoch_losses, axis=0)
             total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_losses
+
+            history_loss_a.append(loss_a)
+            history_loss_f_uv.append(loss_u + loss_v)
+            history_loss_f_ma.append(loss_m + loss_pde_a)
             
-            
-            # Logging
-            num_epochs_per_log = 1
-            if epoch % num_epochs_per_log == 0:
-                time_for_epoch = time.time() - start_epoch
-                start_epoch = time.time()
-                log_msg = f"Epoch: {epoch}/{epochs} - Time for {num_epochs_per_log} epochs: {time_for_epoch:.2f}s - Loss: {total_loss:.4e}"
-                log_msg += f" | a: {loss_a:.4e}, NSEW: {loss_bc:.4e}, m: {loss_m:.4e}"
+            if epoch % 1 == 0:
+                time_for_epoch = time.time() - start_epoch_time
+                log_msg = f"Epoch: {epoch}/{epochs} - Time: {time_for_epoch:.2f}s - Loss: {total_loss:.4e}"
+                log_msg += f" | a: {loss_a:.4e}, BC: {loss_bc:.4e}, m: {loss_m:.4e}"
                 log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, pde_a: {loss_pde_a:.4e}"
                 logger.info(log_msg)
             
@@ -392,7 +412,6 @@ def main():
                 logger.info(f"Saving checkpoint at epoch {epoch} with loss {total_loss:.4e}")
                 for f in glob.glob(os.path.join(dirname, "*_weights.h5")):
                     os.remove(f)
-                # sanitize the loss for the filename
                 safe_loss = f"{total_loss:.4e}".replace("+", "").replace("-", "m")
                 weight_filename = f"loss_{safe_loss}.weights.h5"
                 pinn.nn.save_weights(os.path.join(dirname, weight_filename))
@@ -400,6 +419,86 @@ def main():
 
     total_training_time = time.time() - start_total
     logger.info(f"\nTotal training time: {total_training_time:.3f}s")
+    
+    logger.info("\n" + "="*50)
+    logger.info("PERFORMING FINAL EVALUATION AND REPORTING")
+    logger.info("="*50)
+
+    list_of_files = glob.glob(os.path.join(dirname, '*.weights.h5'))
+    if list_of_files:
+        latest_file = max(list_of_files, key=os.path.getctime)
+        logger.info(f"Loading best model weights from: {os.path.basename(latest_file)}\n")
+        pinn.nn.load_weights(latest_file)
+    else:
+        logger.info("No checkpoint file found. Evaluating with final weights from training.\n")
+
+    data_A_full = to_tensor_tuple(training_data['A'], training_data['A'].columns)
+    data_PDE_full = to_tensor_tuple(training_data['PDE'], ['x_PDE', 'y_PDE', 't_PDE'])
+    data_N_full = to_tensor_tuple(training_data['N'], training_data['N'].columns)
+    data_EW_full = to_tensor_tuple(training_data['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
+    data_NSEW_full = to_tensor_tuple(training_data['NSEW'], training_data['NSEW'].columns)
+
+    final_losses = pinn.compute_loss(data_A_full, data_PDE_full, data_N_full, data_EW_full, data_NSEW_full)
+    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = final_losses
+
+    logger.info("--- Final Loss Breakdown ---")
+    logger.info(f"MSE_alpha (volume fraction): {loss_a.numpy():.4e}")
+    logger.info(f"MSE_BC                     : {loss_bc.numpy():.4e}")
+    logger.info(f"MSE_f,m                    : {loss_m.numpy():.4e}")
+    logger.info(f"MSE_f,u                    : {loss_u.numpy():.4e}")
+    logger.info(f"MSE_f,v                    : {loss_v.numpy():.4e}")
+    logger.info(f"MSE_f,a                    : {loss_pde_a.numpy():.4e}")
+    logger.info("----------------------------\n")
+
+    logger.info("Generating and saving loss history plots...")
+    epochs_range = range(1, len(history_loss_a) + 1)
+    
+    # Plot 1: MSE_alpha
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs_range, history_loss_a)
+    plt.title(f'MSE of Volume Fraction (alpha) vs. Epochs ({adaptive_mode} - {activation_choice})')
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE Loss')
+    plt.yscale('log')
+    plt.grid(True, which="both", ls="--")
+    plt.savefig(os.path.join(dirname, 'loss_history_alpha.png'))
+    
+    # Plot 2: MSE_f,u + MSE_f,v
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs_range, history_loss_f_uv)
+    plt.title(f'MSE of Momentum (u,v) vs. Epochs ({adaptive_mode} - {activation_choice})')
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE Loss (f_u + f_v)')
+    plt.yscale('log')
+    plt.grid(True, which="both", ls="--")
+    plt.savefig(os.path.join(dirname, 'loss_history_momentum_uv.png'))
+    
+    # Plot 3: MSE_f,m + MSE_f,a
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs_range, history_loss_f_ma)
+    plt.title(f'MSE of Conservation (m,a) vs. Epochs ({adaptive_mode} - {activation_choice})')
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE Loss (f_m + f_a)')
+    plt.yscale('log')
+    plt.grid(True, which="both", ls="--")
+    plt.savefig(os.path.join(dirname, 'loss_history_conservation_ma.png'))
+    
+    plt.close('all') # Close all figures to free memory
+    logger.info("Plots saved successfully.")
+
+    # Save history to a CSV file with a descriptive name
+    history_filename = f"loss_history_{adaptive_mode}_{activation_choice}.csv"
+    history_filepath = os.path.join(dirname, history_filename)
+    
+    history_df = pd.DataFrame({
+        'epoch': epochs_range,
+        'MSE_alpha': history_loss_a,
+        'MSE_f_uv': history_loss_f_uv,
+        'MSE_f_ma': history_loss_f_ma
+    })
+    
+    history_df.to_csv(history_filepath, index=False)
+    logger.info(f"Loss history data saved to: {history_filepath}")
     
     for handler in logger.handlers[:]:
         handler.close()
