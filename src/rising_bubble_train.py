@@ -341,7 +341,7 @@ def main():
     loss_weights_PDE = [1.0, 10.0, 10.0, 1.0]
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
-    checkpoint_interval = 100
+    checkpoint_interval = 1
     num_of_batches = 20
     
     num_samples_total = sum(len(df) for df in training_data.values())
@@ -354,7 +354,6 @@ def main():
     pinn.nn.load_weights('initial_weights.h5')
 
     start_total = time.time()
-    epoch_loss_checkpoints = 1e10
     
     history_loss_a = []
     history_loss_f_uv = []
@@ -408,14 +407,16 @@ def main():
                 log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, pde_a: {loss_pde_a:.4e}"
                 logger.info(log_msg)
             
-            if total_loss < epoch_loss_checkpoints and epoch % checkpoint_interval == 0:
+            # Saves weights every 'checkpoint_interval' epochs, overwriting the previous file.
+            if epoch % checkpoint_interval == 0:
                 logger.info(f"Saving checkpoint at epoch {epoch} with loss {total_loss:.4e}")
+                # Remove previous checkpoint file to ensure only one exists
                 for f in glob.glob(os.path.join(dirname, "*_weights.h5")):
                     os.remove(f)
+                # Save new checkpoint with loss in the filename
                 safe_loss = f"{total_loss:.4e}".replace("+", "").replace("-", "m")
                 weight_filename = f"loss_{safe_loss}.weights.h5"
                 pinn.nn.save_weights(os.path.join(dirname, weight_filename))
-                epoch_loss_checkpoints = total_loss
 
     total_training_time = time.time() - start_total
     logger.info(f"\nTotal training time: {total_training_time:.3f}s")
@@ -432,24 +433,43 @@ def main():
     else:
         logger.info("No checkpoint file found. Evaluating with final weights from training.\n")
 
-    data_A_full = to_tensor_tuple(training_data['A'], training_data['A'].columns)
-    data_PDE_full = to_tensor_tuple(training_data['PDE'], ['x_PDE', 'y_PDE', 't_PDE'])
-    data_N_full = to_tensor_tuple(training_data['N'], training_data['N'].columns)
-    data_EW_full = to_tensor_tuple(training_data['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
-    data_NSEW_full = to_tensor_tuple(training_data['NSEW'], training_data['NSEW'].columns)
+    logger.info("Calculating final loss...")
+    final_evaluation_losses = []
+    # Using batching parameters from the last training phase
+    for b in range(num_batches):
+        batch_dict = {}
+        for key, df in training_data.items(): # Using original, non-shuffled data
+            start_idx = b * prop_batch_sizes[key]
+            end_idx = (b + 1) * prop_batch_sizes[key]
+            batch_dict[key] = df.iloc[start_idx:end_idx]
 
-    final_losses = pinn.compute_loss(data_A_full, data_PDE_full, data_N_full, data_EW_full, data_NSEW_full)
-    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = final_losses
+        if all(batch.empty for batch in batch_dict.values()):
+            continue
+            
+        data_A = to_tensor_tuple(batch_dict['A'], batch_dict['A'].columns)
+        data_PDE = to_tensor_tuple(batch_dict['PDE'], ['x_PDE', 'y_PDE', 't_PDE'])
+        data_N = to_tensor_tuple(batch_dict['N'], batch_dict['N'].columns)
+        data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
+        data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
+        
+        # Compute loss for the batch without training
+        batch_losses = pinn.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW)
+        final_evaluation_losses.append([l.numpy() for l in batch_losses])
+
+    # Calculate the mean loss across all batches
+    avg_final_losses = np.mean(final_evaluation_losses, axis=0)
+    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_final_losses
 
     logger.info("--- Final Loss Breakdown ---")
-    logger.info(f"MSE_alpha (volume fraction): {loss_a.numpy():.4e}")
-    logger.info(f"MSE_BC                     : {loss_bc.numpy():.4e}")
-    logger.info(f"MSE_f,m                    : {loss_m.numpy():.4e}")
-    logger.info(f"MSE_f,u                    : {loss_u.numpy():.4e}")
-    logger.info(f"MSE_f,v                    : {loss_v.numpy():.4e}")
-    logger.info(f"MSE_f,a                    : {loss_pde_a.numpy():.4e}")
+    logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")
+    logger.info(f"MSE_BC                     : {loss_bc:.4e}")
+    logger.info(f"MSE_f,m                    : {loss_m:.4e}")
+    logger.info(f"MSE_f,u                    : {loss_u:.4e}")
+    logger.info(f"MSE_f,v                    : {loss_v:.4e}")
+    logger.info(f"MSE_f,a                    : {loss_pde_a:.4e}")
     logger.info("----------------------------\n")
 
+    # --- Plotting and Saving History (No changes needed here) ---
     logger.info("Generating and saving loss history plots...")
     epochs_range = range(1, len(history_loss_a) + 1)
     
