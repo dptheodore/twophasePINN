@@ -296,7 +296,7 @@ def main():
     # --- CHOOSE YOUR CONFIGURATION ---
     activation_choice = 'tanh'  # Options: 'tanh' or 'sine'
     use_aac_1 = False
-    use_aac_2 = True #If you declare both false, fixed/no activation is used
+    use_aac_2 = False #If you declare both false, fixed/no activation is used
 
     # Build activation function dictionary based on choice
     activation_functions = {activation_choice: range(1, no_layers + 1)}
@@ -341,7 +341,7 @@ def main():
     loss_weights_PDE = [1.0, 10.0, 10.0, 1.0]
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
-    checkpoint_interval = 1
+    checkpoint_interval = 50
     num_of_batches = 20
     
     num_samples_total = sum(len(df) for df in training_data.values())
@@ -363,14 +363,14 @@ def main():
         return tuple(tf.constant(df[c].to_numpy().reshape(-1, 1), dtype=tf.float32) for c in columns)
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rates[0])
+    current_best_total_loss = float('inf')
     for i, (epochs, lr) in enumerate(zip(epochs_list, learning_rates)):
         logger.info(f"\n--- Starting Training Phase {i+1}/{len(epochs_list)} ---")
         logger.info(f"Epochs: {epochs}, Learning Rate: {lr}")
         optimizer.learning_rate.assign(lr)
         prop_batch_sizes, num_batches = get_proportional_batch_sizes(total_batch_size, training_data, logger)
-        
+        start_checkpoint_time = time.time()
         for epoch in range(1, epochs + 1):
-            start_epoch_time = time.time()
             epoch_losses = []
             shuffled_data = {key: df.sample(frac=1) for key, df in training_data.items()}
 
@@ -400,15 +400,17 @@ def main():
             history_loss_f_uv.append(loss_u + loss_v)
             history_loss_f_ma.append(loss_m + loss_pde_a)
             
-            if epoch % 1 == 0:
-                time_for_epoch = time.time() - start_epoch_time
+            if epoch % checkpoint_interval == 0:
+                current_time = time.time()
+                time_for_epoch = current_time - start_checkpoint_time
+                start_checkpoint_time = current_time
                 log_msg = f"Epoch: {epoch}/{epochs} - Time: {time_for_epoch:.2f}s - Loss: {total_loss:.4e}"
                 log_msg += f" | a: {loss_a:.4e}, BC: {loss_bc:.4e}, m: {loss_m:.4e}"
                 log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, pde_a: {loss_pde_a:.4e}"
                 logger.info(log_msg)
             
             # Saves weights every 'checkpoint_interval' epochs, overwriting the previous file.
-            if epoch % checkpoint_interval == 0:
+            if epoch % checkpoint_interval == 0 and total_loss < current_best_total_loss:
                 logger.info(f"Saving checkpoint at epoch {epoch} with loss {total_loss:.4e}")
                 # Remove previous checkpoint file to ensure only one exists
                 for f in glob.glob(os.path.join(dirname, "*_weights.h5")):
@@ -417,6 +419,7 @@ def main():
                 safe_loss = f"{total_loss:.4e}".replace("+", "").replace("-", "m")
                 weight_filename = f"loss_{safe_loss}.weights.h5"
                 pinn.nn.save_weights(os.path.join(dirname, weight_filename))
+                current_best_total_loss = total_loss
 
     total_training_time = time.time() - start_total
     logger.info(f"\nTotal training time: {total_training_time:.3f}s")
