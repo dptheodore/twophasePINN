@@ -287,6 +287,14 @@ def main():
     NOP_south = (20, 20)
     NOP_east = (20, 20)
     NOP_west = (20, 20)
+
+    #every point not in boundary, compute small marching squares window around it (i.e. 1 voxel)
+    #plot is bunch of little squares around each little point in domain, overlapping squares everywhere, espec. near interface
+    #once have meshes can compute theorems
+    #theorem is compute fraction of top and bottom and fraction of left and right that are immersed inside the red or blue fields
+    #gradient, deriv of volume fraciton field, interp on mesh, --> gets normal vec
+    #4 points vert 5 points horiz entire domain, compute theorems in each region
+    #eventually nice: for any arb point in domain compute region around it
     training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
 
     # --- NN Architecture and Hyperparameters --- #
