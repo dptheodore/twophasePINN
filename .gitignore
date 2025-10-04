@@ -8,3 +8,5 @@ src/logs
 src/*.keras
 typings/*
 pyrightconfig.json
+*.png
+*.gif
