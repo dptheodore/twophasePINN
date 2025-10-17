@@ -22,6 +22,8 @@ import matplotlib.pyplot as plt
 import tensorflow.keras.backend as K
 from tensorflow.keras.utils import get_custom_objects
 
+TF_FUNCTION_SETTINGS = dict(reduce_retracing=True, experimental_relax_shapes=True)
+
 # Define and register the custom sine activation function so Keras can find it by name
 def sine_activation(x):
     return K.sin(x)
@@ -96,7 +98,7 @@ class TwoPhasePinn(tf.keras.Model):
         # The model built by NNCreator is now stored in self.nn
         return self.nn(inputs)
 
-    @tf.function
+    @tf.function(**TF_FUNCTION_SETTINGS)
     def compute_gradients(self, x, y, t):
         # Use a nested tape to compute second-order derivatives
         with tf.GradientTape(persistent=True) as tape2:
@@ -135,7 +137,7 @@ class TwoPhasePinn(tf.keras.Model):
                (p, p_x, p_y), \
                (a, a_x, a_y, a_t, a_xx, a_yy, a_xy)
 
-    @tf.function
+    @tf.function(**TF_FUNCTION_SETTINGS)
     def PDE_caller(self, x, y, t):
         u_grads, v_grads, p_grads, a_grads = self.compute_gradients(x, y, t)
         u, u_x, u_y, u_t, u_xx, u_yy = u_grads
@@ -169,8 +171,8 @@ class TwoPhasePinn(tf.keras.Model):
 
         return PDE_m, PDE_u, PDE_v, PDE_a
 
-    @tf.function
-    def compute_loss(self, data_A, data_PDE, data_N, data_EW, data_NSEW):
+    @tf.function(**TF_FUNCTION_SETTINGS)
+    def compute_loss(self, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM):
         # Unpack tensor tuples
         x_A, y_A, t_A, a_A = data_A
         x_PDE, y_PDE, t_PDE = data_PDE
@@ -200,6 +202,13 @@ class TwoPhasePinn(tf.keras.Model):
         loss_v_EW = tf.reduce_mean(tf.square(pred_east[1] - pred_west[1]))
         loss_p_EW = tf.reduce_mean(tf.square(pred_east[2] - pred_west[2]))
 
+        tf.debugging.check_numerics(pred_u_NSEW, "pred_u_NSEW has NaN or Inf")
+        tf.debugging.check_numerics(pred_v_NSEW, "pred_v_NSEW has NaN or Inf")
+        tf.debugging.check_numerics(pred_p_N, "pred_p_N has NaN or Inf")
+        tf.debugging.check_numerics(pred_east[0], "pred_east_u has NaN or Inf")
+        tf.debugging.check_numerics(pred_west[0], "pred_west_u has NaN or Inf")
+        tf.debugging.check_numerics(pred_east[2], "pred_east_p has NaN or Inf")
+
         loss_BC = loss_u_NSEW + loss_v_NSEW + loss_p_N + loss_u_EW + loss_v_EW + loss_p_EW
 
         # Loss PDE (Physics-Informed)
@@ -211,17 +220,38 @@ class TwoPhasePinn(tf.keras.Model):
 
         loss_PDE = tf.tensordot(tf.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a]), self.loss_weights_PDE, 1)
 
-        # Total Loss
-        total_loss = loss_a_A + loss_BC + loss_PDE
+        xg, yg, tg, grad_x, grad_y, normal_x, normal_y = data_GEOM
 
-        return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a
+        # Stack gradients and normals for comparison
+        grad_target = tf.concat([grad_x, grad_y], axis=1)
+        normal_target = tf.concat([normal_x, normal_y], axis=1)
+
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch([xg, yg])
+            pred_u, pred_v, pred_p, pred_a = self.call(tf.concat([xg, yg, tg], axis=1))
+        grad_a = tape.gradient(pred_a, [xg, yg])
+        del tape
+
+        grad_pred = tf.concat(grad_a, axis=1)
+
+        # Normalize both (directional comparison)
+        grad_pred_unit = grad_pred / (tf.norm(grad_pred, axis=1, keepdims=True) + 1e-12)
+        normal_target_unit = normal_target / (tf.norm(normal_target, axis=1, keepdims=True) + 1e-12)
+
+        # Mean squared directional mismatch
+        loss_geom = tf.reduce_mean(tf.square(grad_pred_unit - normal_target_unit))
+
+        # === Combine all losses ===
+        total_loss = loss_a_A + loss_BC + loss_PDE + loss_geom
+
+        return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a, loss_geom
 
 
-    @tf.function
-    def train_step(self, optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW):
+    @tf.function(**TF_FUNCTION_SETTINGS)
+    def train_step(self, optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM):
         with tf.GradientTape() as tape:
             # Pass the tensor tuples directly to compute_loss
-            losses = self.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW)
+            losses = self.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
             total_loss = losses[0]
 
         gradients = tape.gradient(total_loss, self.trainable_variables)
@@ -269,6 +299,15 @@ def get_proportional_batch_sizes(total_batch_size, training_data, logger):
             batch_sizes[key] = math.ceil(proportion * total_batch_size)
         else:
             batch_sizes[key] = 0
+
+    batch_sizes = {
+        'A': max(16, batch_sizes['A']),
+        'PDE': max(32, batch_sizes['PDE']),
+        'N': max(16, batch_sizes['N']),
+        'EW': max(16, batch_sizes['EW']),
+        'NSEW': max(16, batch_sizes['NSEW']),
+        'GEOM': max(16, batch_sizes['GEOM'])
+    }
             
     logger.info(f"Total samples: {num_samples_total}, Desired batch size: {total_batch_size}")
     logger.info(f"Calculated num_batches: {num_batches}, Proportional batch sizes: {batch_sizes}")
@@ -296,7 +335,6 @@ def main():
     #4 points vert 5 points horiz entire domain, compute theorems in each region
     #eventually nice: for any arb point in domain compute region around it
     training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
-
     # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
     hidden_layers = [400] * no_layers
@@ -366,6 +404,7 @@ def main():
     history_loss_a = []
     history_loss_f_uv = []
     history_loss_f_ma = []
+    history_loss_geom = []
     
     def to_tensor_tuple(df, columns):
         return tuple(tf.constant(df[c].to_numpy().reshape(-1, 1), dtype=tf.float32) for c in columns)
@@ -397,16 +436,18 @@ def main():
                 data_N = to_tensor_tuple(batch_dict['N'], batch_dict['N'].columns)
                 data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
                 data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
+                data_GEOM = to_tensor_tuple(batch_dict['GEOM'], batch_dict['GEOM'].columns)
                 
-                batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW)
+                batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
                 epoch_losses.append([l.numpy() for l in batch_loss_values])
 
             avg_losses = np.mean(epoch_losses, axis=0)
-            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_losses
+            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a, loss_geom = avg_losses
 
             history_loss_a.append(loss_a)
             history_loss_f_uv.append(loss_u + loss_v)
             history_loss_f_ma.append(loss_m + loss_pde_a)
+            history_loss_geom.append(loss_geom)
             
             if epoch % checkpoint_interval == 0:
                 current_time = time.time()
@@ -415,6 +456,7 @@ def main():
                 log_msg = f"Epoch: {epoch}/{epochs} - Time: {time_for_epoch:.2f}s - Loss: {total_loss:.4e}"
                 log_msg += f" | a: {loss_a:.4e}, BC: {loss_bc:.4e}, m: {loss_m:.4e}"
                 log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, pde_a: {loss_pde_a:.4e}"
+                log_msg += f" geom: {loss_geom:.4e}"
                 logger.info(log_msg)
             
             # Saves weights every 'checkpoint_interval' epochs, overwriting the previous file.
@@ -462,14 +504,15 @@ def main():
         data_N = to_tensor_tuple(batch_dict['N'], batch_dict['N'].columns)
         data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
         data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
+        data_GEOM = to_tensor_tuple(batch_dict['GEOM'], batch_dict['GEOM'].columns)
         
         # Compute loss for the batch without training
-        batch_losses = pinn.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW)
+        batch_losses = pinn.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
         final_evaluation_losses.append([l.numpy() for l in batch_losses])
 
     # Calculate the mean loss across all batches
     avg_final_losses = np.mean(final_evaluation_losses, axis=0)
-    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_final_losses
+    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a, loss_geom = avg_final_losses
 
     logger.info("--- Final Loss Breakdown ---")
     logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")
@@ -478,6 +521,7 @@ def main():
     logger.info(f"MSE_f,u                    : {loss_u:.4e}")
     logger.info(f"MSE_f,v                    : {loss_v:.4e}")
     logger.info(f"MSE_f,a                    : {loss_pde_a:.4e}")
+    logger.info(f"MSE_GEOM                    : {loss_geom:.4e}")
     logger.info("----------------------------\n")
 
     # --- Plotting and Saving History (No changes needed here) ---
@@ -513,6 +557,16 @@ def main():
     plt.yscale('log')
     plt.grid(True, which="both", ls="--")
     plt.savefig(os.path.join(dirname, 'loss_history_conservation_ma.png'))
+
+    # Plot 4: MSE GEOM
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs_range, history_loss_geom)
+    plt.title(f'MSE of Geometric Loss Grad vs Int. Norm. vs. Epochs ({adaptive_mode} - {activation_choice})')
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE Loss Geom')
+    plt.yscale('log')
+    plt.grid(True, which="both", ls="--")
+    plt.savefig(os.path.join(dirname, 'loss_history_geom.png'))
     
     plt.close('all') # Close all figures to free memory
     logger.info("Plots saved successfully.")
@@ -525,7 +579,8 @@ def main():
         'epoch': epochs_range,
         'MSE_alpha': history_loss_a,
         'MSE_f_uv': history_loss_f_uv,
-        'MSE_f_ma': history_loss_f_ma
+        'MSE_f_ma': history_loss_f_ma,
+        'MSE_geom': history_loss_geom
     })
     
     history_df.to_csv(history_filepath, index=False)

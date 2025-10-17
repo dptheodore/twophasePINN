@@ -194,7 +194,14 @@ def get_training_data(NOP_A, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west):
         Y = np.array(data["Y"])
         times = np.array(data["time"])
         levelset = -np.array(data["levelset"])
-    
+        comp = data["computation_regions"]
+        x_geom = np.array(comp["x_center"])
+        y_geom = np.array(comp["y_center"])
+        t_geom = np.array(comp["time_value"])
+        grad_vec = np.array(comp["grad_vec"])
+        int_normal = np.array(comp["integrated_normal"])
+
+
 
     # TIME SNAPSHOT SELECTION
     indices = np.arange(len(times))
@@ -233,7 +240,20 @@ def get_training_data(NOP_A, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west):
     data_east[:,:3] /= L_ref
     data_west[:,:3] /= L_ref
     data_nsew[:,:3] /= L_ref
-    
+
+
+    x_geom /= L_ref
+    y_geom /= L_ref
+    data_GEOM = pd.DataFrame({
+        "x_geom": x_geom,
+        "y_geom": y_geom,
+        "t_geom": t_geom,
+        "grad_x": grad_vec[:, 0],
+        "grad_y": grad_vec[:, 1],
+        "normal_x": int_normal[:, 0],
+        "normal_y": int_normal[:, 1],
+    })
+
     # PLOTTING SOME TIME SNAPSHOTS
     for i in range(0, len(times), math.ceil(len(times)/3)):
         fig, ax = plt.subplots(1,3)
@@ -257,4 +277,4 @@ def get_training_data(NOP_A, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west):
     data_NSEW = pd.DataFrame(data=np.vstack([data_north[:,0:5], data_south, data_east[:NOP_east[0]], data_west[:NOP_west[0]]]), columns=["x_NSEW", "y_NSEW", "t_NSEW", "u_NSEW", "v_NSEW"])
     data_A = pd.DataFrame(data=data_A, columns=["x_A", "y_A", "t_A", "a_A"])
     data_PDE = pd.DataFrame(data=np.vstack([data_PDE, np.hstack([data_nsew, np.zeros((len(data_nsew), 1))])]), columns=["x_PDE", "y_PDE", "t_PDE", "f_PDE"])
-    return dict(A=data_A, PDE=data_PDE, N=data_N, EW=data_EW, NSEW=data_NSEW)
+    return dict(A=data_A, PDE=data_PDE, N=data_N, EW=data_EW, NSEW=data_NSEW, GEOM=data_GEOM)
