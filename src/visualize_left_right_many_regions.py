@@ -54,6 +54,9 @@ def create_animation(h5_path, num_frames, time_range, num_patches=(8, 8)):
         times, levelset_data = np.array(data["time"]), np.array(data["levelset"])
 
     levelset_data /= 8.0
+    #levelset_data = -levelset_data might need to flip this back based on the data
+
+    levelset_data = (levelset_data - (np.min(levelset_data))) / (np.max(levelset_data) - np.min(levelset_data))
 
     start_idx = np.searchsorted(times, time_range[0])
     end_idx = np.searchsorted(times, time_range[1], side='right')
@@ -62,17 +65,13 @@ def create_animation(h5_path, num_frames, time_range, num_patches=(8, 8)):
     frame_dir, filenames = "multi_region_frames", []
     os.makedirs(frame_dir, exist_ok=True)
     grid_scale = X[1] - X[0]
-
     training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
 
     # --- patches
     data_A = training_data['A'].to_numpy()
     region_half_size = (10*grid_scale,10*grid_scale)
     trainingDataTimeList = np.array(list(set(training_data['A']['t_A'])), dtype=float)
-
     patches_list_a = compute_patches_for_points(data_A[:,:3], trainingDataTimeList,levelset_data, X, Y, grid_scale, region_half_size)
-    #patches_list = generate_patches(X, Y, num_patches[0], num_patches[1])
-    #patches_list = [(-0.12451171875, 0.0, -0.24951171875, -0.124755859375)]
     fig, ax = plt.subplots(figsize=(8, 8))
 
     error_history = []
@@ -90,7 +89,7 @@ def create_animation(h5_path, num_frames, time_range, num_patches=(8, 8)):
 
         ax.clear()
         ax.imshow(levelset_t, extent=[X[0], X[-1], Y[0], Y[-1]],
-                  origin='lower', cmap='coolwarm', vmin=-1.0, vmax=1.0, alpha=0.5)
+                  origin='lower', cmap='coolwarm', vmin=0, vmax=1.0, alpha=0.5)
 
         patch_errors = []
 
@@ -100,7 +99,7 @@ def create_animation(h5_path, num_frames, time_range, num_patches=(8, 8)):
             region_bounds = patch["region_bounds"]
             grad_vec = patch["grad_vec"]
             integrated_normal = patch["integrated_normal"]
-            edges = patch["edges"]
+            edges = patch["edges_info_for_plot"]
             intersection_span_bottom = patch["intersection_span_bottom"]
             intersection_span_left = patch["intersection_span_left"]
             intersection_span_right = patch["intersection_span_right"]
@@ -108,8 +107,8 @@ def create_animation(h5_path, num_frames, time_range, num_patches=(8, 8)):
             y_bottom, y_top = region_bounds[2],region_bounds[3]
             x_left, x_right = region_bounds[0], region_bounds[1]
             x_min, x_max, y_min, y_max = X[0], X[-1], Y[0], Y[-1]
-            for p1, p2 in edges:
-                ax.plot([p1[1] + x_min, p2[1] + x_min], [p1[0] + y_min, p2[0] + y_min], color='black', linewidth=1.5, zorder=3)
+            # for p1, p2 in edges:
+            #     ax.plot([p1[1] + x_min, p2[1] + x_min], [p1[0] + y_min, p2[0] + y_min], color='black', linewidth=1.5, zorder=3)
 
             x_start, x_end = intersection_span_bottom
             if x_start is not None and x_end is not None:

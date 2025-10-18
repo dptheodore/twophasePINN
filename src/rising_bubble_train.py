@@ -80,6 +80,64 @@ class TwoPhasePinn(tf.keras.Model):
         nn_creator = NNCreator(tf.float32)
         self.nn = nn_creator.get_model_dnn(3, hidden_layers, output_layer, activation_functions_dict, self.use_ad_act)
 
+    def compute_geom_loss(self, data_GEOM, debug=False):
+        """
+        Compute patch-level geometric loss for PINN.
+        data_GEOM: xg, yg, tg, grad_x, grad_y, normal_x, normal_y
+        grad_vec and integrated_normal are ground truth from marching squares.
+        """
+
+        xg, yg, tg, grad_x_gt, grad_y_gt, normal_x_gt, normal_y_gt = data_GEOM
+        batch_size = tf.shape(xg)[0]
+
+        # Predicted field
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch([xg, yg])
+            pred_u, pred_v, pred_p, pred_a = self.call(tf.concat([xg, yg, tg], axis=1))
+
+        # Compute local gradients
+        grad_x_pred, grad_y_pred = tape.gradient(pred_a, [xg, yg])
+        del tape
+
+        # --- integrate gradients over patch edges ---
+        # Here we approximate edge integration with simple sums over the points in the patch
+        # If you have explicit patch edge indices, you can sum over those
+        # For simplicity, assume each point represents a small patch area / edge length
+
+        # Build predicted patch-level vector
+        grad_vec_pred = tf.stack([tf.reduce_sum(grad_x_pred, axis=0),
+                                  tf.reduce_sum(grad_y_pred, axis=0)], axis=0)
+
+        # Stack ground truth for comparison
+        grad_vec_gt = tf.stack([tf.reduce_sum(grad_x_gt, axis=0),
+                                tf.reduce_sum(grad_y_gt, axis=0)], axis=0)
+
+        # Compute patch-level MSE
+        loss_geom_vec = tf.reduce_mean(tf.square(grad_vec_pred - grad_vec_gt))
+
+        # Similarly, we can compare integrated normals (unit vectors)
+        normal_pred = tf.stack([grad_x_pred, grad_y_pred], axis=1)
+        normal_pred_unit = normal_pred / (tf.norm(normal_pred, axis=1, keepdims=True) + 1e-12)
+        normal_gt = tf.stack([normal_x_gt, normal_y_gt], axis=1)
+        normal_gt_unit = normal_gt / (tf.norm(normal_gt, axis=1, keepdims=True) + 1e-12)
+        loss_geom_normal = tf.reduce_mean(tf.square(normal_pred_unit - normal_gt_unit))
+
+        # Combine losses
+        loss_geom = loss_geom_vec + loss_geom_normal
+
+        if debug:
+            tf.print("Grad_vec_pred:", grad_vec_pred)
+            tf.print("Grad_vec_gt:", grad_vec_gt)
+            tf.print("Integrated normals loss:", loss_geom_normal)
+            tf.print("Geom loss (combined):", loss_geom)
+
+        return loss_geom
+
+
+
+
+
+
     def _get_activation_function_dict(self, hidden_layers, activation_functions, adaptive_activation_coeff, adaptive_activation_n):
         """Helper to create the activation dictionary for NNCreator."""
         activation_dict = {i: [None, None, 0] for i in range(1, len(hidden_layers) + 1)}
@@ -202,13 +260,6 @@ class TwoPhasePinn(tf.keras.Model):
         loss_v_EW = tf.reduce_mean(tf.square(pred_east[1] - pred_west[1]))
         loss_p_EW = tf.reduce_mean(tf.square(pred_east[2] - pred_west[2]))
 
-        tf.debugging.check_numerics(pred_u_NSEW, "pred_u_NSEW has NaN or Inf")
-        tf.debugging.check_numerics(pred_v_NSEW, "pred_v_NSEW has NaN or Inf")
-        tf.debugging.check_numerics(pred_p_N, "pred_p_N has NaN or Inf")
-        tf.debugging.check_numerics(pred_east[0], "pred_east_u has NaN or Inf")
-        tf.debugging.check_numerics(pred_west[0], "pred_west_u has NaN or Inf")
-        tf.debugging.check_numerics(pred_east[2], "pred_east_p has NaN or Inf")
-
         loss_BC = loss_u_NSEW + loss_v_NSEW + loss_p_N + loss_u_EW + loss_v_EW + loss_p_EW
 
         # Loss PDE (Physics-Informed)
@@ -220,26 +271,7 @@ class TwoPhasePinn(tf.keras.Model):
 
         loss_PDE = tf.tensordot(tf.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a]), self.loss_weights_PDE, 1)
 
-        xg, yg, tg, grad_x, grad_y, normal_x, normal_y = data_GEOM
-
-        # Stack gradients and normals for comparison
-        grad_target = tf.concat([grad_x, grad_y], axis=1)
-        normal_target = tf.concat([normal_x, normal_y], axis=1)
-
-        with tf.GradientTape(persistent=True) as tape:
-            tape.watch([xg, yg])
-            pred_u, pred_v, pred_p, pred_a = self.call(tf.concat([xg, yg, tg], axis=1))
-        grad_a = tape.gradient(pred_a, [xg, yg])
-        del tape
-
-        grad_pred = tf.concat(grad_a, axis=1)
-
-        # Normalize both (directional comparison)
-        grad_pred_unit = grad_pred / (tf.norm(grad_pred, axis=1, keepdims=True) + 1e-12)
-        normal_target_unit = normal_target / (tf.norm(normal_target, axis=1, keepdims=True) + 1e-12)
-
-        # Mean squared directional mismatch
-        loss_geom = tf.reduce_mean(tf.square(grad_pred_unit - normal_target_unit))
+        loss_geom = self.compute_geom_loss(data_GEOM, debug=False)
 
         # === Combine all losses ===
         total_loss = loss_a_A + loss_BC + loss_PDE + loss_geom
@@ -335,6 +367,8 @@ def main():
     #4 points vert 5 points horiz entire domain, compute theorems in each region
     #eventually nice: for any arb point in domain compute region around it
     training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
+    training_data['A']['a_A'] = (training_data['A']['a_A'] * 2.0) - 1.0
+
     # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
     hidden_layers = [400] * no_layers
@@ -387,7 +421,7 @@ def main():
     loss_weights_PDE = [1.0, 10.0, 10.0, 1.0]
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
-    checkpoint_interval = 50
+    checkpoint_interval = 1
     num_of_batches = 20
     
     num_samples_total = sum(len(df) for df in training_data.values())
@@ -437,7 +471,6 @@ def main():
                 data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
                 data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
                 data_GEOM = to_tensor_tuple(batch_dict['GEOM'], batch_dict['GEOM'].columns)
-                
                 batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
                 epoch_losses.append([l.numpy() for l in batch_loss_values])
 

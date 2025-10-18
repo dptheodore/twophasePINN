@@ -5,6 +5,7 @@ from scipy.interpolate import interpn
 
 
 def process_line(X, Y, grid_scale, levelset_t, intersections, orientation, fixed_coord, lo_bound, hi_bound):
+    ISO_VALUE = 0.5
     # Trim to region bounds
     if len(intersections) == 0:
         return 0.0, (None, None), {}
@@ -46,7 +47,7 @@ def process_line(X, Y, grid_scale, levelset_t, intersections, orientation, fixed
 
         val_mid = interpn((Y, X), levelset_t, np.array([sample_point]),
                           method='linear', bounds_error=False, fill_value=1.0)[0]
-        if val_mid < 0.0:
+        if val_mid < ISO_VALUE:
             total_len += seg_len
             inside_intervals.append((a, b))
 
@@ -59,7 +60,7 @@ def process_line(X, Y, grid_scale, levelset_t, intersections, orientation, fixed
                                method='linear', bounds_error=False, fill_value=1.0)[0]
             right_val = interpn((Y, X), levelset_t, np.array([(fixed_coord, right_x)]),
                                 method='linear', bounds_error=False, fill_value=1.0)[0]
-            intersection_side_info[float(x)] = (left_val < 0.0, right_val < 0.0)
+            intersection_side_info[float(x)] = (left_val < ISO_VALUE, right_val < ISO_VALUE)
         else:
             lower_y = x - delta
             upper_y = x + delta
@@ -67,7 +68,7 @@ def process_line(X, Y, grid_scale, levelset_t, intersections, orientation, fixed
                                 method='linear', bounds_error=False, fill_value=1.0)[0]
             upper_val = interpn((Y, X), levelset_t, np.array([(upper_y, fixed_coord)]),
                                 method='linear', bounds_error=False, fill_value=1.0)[0]
-            intersection_side_info[float(x)] = (lower_val < 0.0, upper_val < 0.0)
+            intersection_side_info[float(x)] = (lower_val < ISO_VALUE, upper_val < ISO_VALUE)
 
     # compute span as bounding box of inside intervals (if any)
     if inside_intervals:
@@ -110,7 +111,7 @@ def compute_grad_normals_region_bounded(levelset_t, X, Y, grid_scale, region_bou
     # Marching squares
     ms_grid = Grid(scale=grid_scale, x_count=nx - 1, y_count=ny - 1)
     ms_grid.values = levelset_t.astype(np.float32)
-    edges = march(ms_grid, iso=0.0, interpolated=True)
+    edges = march(ms_grid, iso=0.5, interpolated=True)
 
     edges_info_for_plot = []
     integrated_normal_sum = np.zeros(2, dtype=np.float64)
