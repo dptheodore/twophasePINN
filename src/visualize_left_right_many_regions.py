@@ -8,6 +8,7 @@ from tqdm import tqdm
 from compute_patches import compute_patches_for_points
 from generate_points import get_training_data
 import tensorflow as tf
+from matplotlib.animation import FuncAnimation
 # -----------------------------
 # Utility: generate rectangular patches covering the domain
 # -----------------------------
@@ -54,10 +55,9 @@ def create_animation(h5_path, num_frames, time_range, num_patches=(8, 8)):
         times, levelset_data = np.array(data["time"]), np.array(data["levelset"])
 
     levelset_data /= 8.0
-    #levelset_data = -levelset_data might need to flip this back based on the data
+    levelset_data = -levelset_data #might need to flip this back based on the data
 
     levelset_data = (levelset_data - (np.min(levelset_data))) / (np.max(levelset_data) - np.min(levelset_data))
-
     start_idx = np.searchsorted(times, time_range[0])
     end_idx = np.searchsorted(times, time_range[1], side='right')
     indices = np.linspace(start_idx, end_idx-1, num_frames, dtype=int)
@@ -71,6 +71,7 @@ def create_animation(h5_path, num_frames, time_range, num_patches=(8, 8)):
     data_A = training_data['A'].to_numpy()
     region_half_size = (10*grid_scale,10*grid_scale)
     trainingDataTimeList = np.array(list(set(training_data['A']['t_A'])), dtype=float)
+
     patches_list_a = compute_patches_for_points(data_A[:,:3], trainingDataTimeList,levelset_data, X, Y, grid_scale, region_half_size)
     fig, ax = plt.subplots(figsize=(8, 8))
 
@@ -78,7 +79,7 @@ def create_animation(h5_path, num_frames, time_range, num_patches=(8, 8)):
 
     testSet = set()
     for p in patches_list_a['results']:
-        testSet.add(p['time_value']/4)
+        testSet.add(p['time_value'])
     timeList = sorted(list(testSet))
     indicesUsed = [i for (i, time) in enumerate(times) for timeSnapshot in timeList if np.isclose(time, timeSnapshot)]
 
