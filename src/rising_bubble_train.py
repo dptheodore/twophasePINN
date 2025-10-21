@@ -22,8 +22,6 @@ import matplotlib.pyplot as plt
 import tensorflow.keras.backend as K
 from tensorflow.keras.utils import get_custom_objects
 
-TF_FUNCTION_SETTINGS = dict(reduce_retracing=True, experimental_relax_shapes=True)
-
 # Define and register the custom sine activation function so Keras can find it by name
 def sine_activation(x):
     return K.sin(x)
@@ -80,64 +78,6 @@ class TwoPhasePinn(tf.keras.Model):
         nn_creator = NNCreator(tf.float32)
         self.nn = nn_creator.get_model_dnn(3, hidden_layers, output_layer, activation_functions_dict, self.use_ad_act)
 
-    def compute_geom_loss(self, data_GEOM, debug=False):
-        """
-        Compute patch-level geometric loss for PINN.
-        data_GEOM: xg, yg, tg, grad_x, grad_y, normal_x, normal_y
-        grad_vec and integrated_normal are ground truth from marching squares.
-        """
-
-        xg, yg, tg, grad_x_gt, grad_y_gt, normal_x_gt, normal_y_gt = data_GEOM
-        batch_size = tf.shape(xg)[0]
-
-        # Predicted field
-        with tf.GradientTape(persistent=True) as tape:
-            tape.watch([xg, yg])
-            pred_u, pred_v, pred_p, pred_a = self.call(tf.concat([xg, yg, tg], axis=1))
-
-        # Compute local gradients
-        grad_x_pred, grad_y_pred = tape.gradient(pred_a, [xg, yg])
-        del tape
-
-        # --- integrate gradients over patch edges ---
-        # Here we approximate edge integration with simple sums over the points in the patch
-        # If you have explicit patch edge indices, you can sum over those
-        # For simplicity, assume each point represents a small patch area / edge length
-
-        # Build predicted patch-level vector
-        grad_vec_pred = tf.stack([tf.reduce_sum(grad_x_pred, axis=0),
-                                  tf.reduce_sum(grad_y_pred, axis=0)], axis=0)
-
-        # Stack ground truth for comparison
-        grad_vec_gt = tf.stack([tf.reduce_sum(grad_x_gt, axis=0),
-                                tf.reduce_sum(grad_y_gt, axis=0)], axis=0)
-
-        # Compute patch-level MSE
-        loss_geom_vec = tf.reduce_mean(tf.square(grad_vec_pred - grad_vec_gt))
-
-        # Similarly, we can compare integrated normals (unit vectors)
-        normal_pred = tf.stack([grad_x_pred, grad_y_pred], axis=1)
-        normal_pred_unit = normal_pred / (tf.norm(normal_pred, axis=1, keepdims=True) + 1e-12)
-        normal_gt = tf.stack([normal_x_gt, normal_y_gt], axis=1)
-        normal_gt_unit = normal_gt / (tf.norm(normal_gt, axis=1, keepdims=True) + 1e-12)
-        loss_geom_normal = tf.reduce_mean(tf.square(normal_pred_unit - normal_gt_unit))
-
-        # Combine losses
-        loss_geom = loss_geom_vec + loss_geom_normal
-
-        if debug:
-            tf.print("Grad_vec_pred:", grad_vec_pred)
-            tf.print("Grad_vec_gt:", grad_vec_gt)
-            tf.print("Integrated normals loss:", loss_geom_normal)
-            tf.print("Geom loss (combined):", loss_geom)
-
-        return loss_geom
-
-
-
-
-
-
     def _get_activation_function_dict(self, hidden_layers, activation_functions, adaptive_activation_coeff, adaptive_activation_n):
         """Helper to create the activation dictionary for NNCreator."""
         activation_dict = {i: [None, None, 0] for i in range(1, len(hidden_layers) + 1)}
@@ -156,7 +96,7 @@ class TwoPhasePinn(tf.keras.Model):
         # The model built by NNCreator is now stored in self.nn
         return self.nn(inputs)
 
-    @tf.function(**TF_FUNCTION_SETTINGS)
+    @tf.function
     def compute_gradients(self, x, y, t):
         # Use a nested tape to compute second-order derivatives
         with tf.GradientTape(persistent=True) as tape2:
@@ -195,7 +135,7 @@ class TwoPhasePinn(tf.keras.Model):
                (p, p_x, p_y), \
                (a, a_x, a_y, a_t, a_xx, a_yy, a_xy)
 
-    @tf.function(**TF_FUNCTION_SETTINGS)
+    @tf.function
     def PDE_caller(self, x, y, t):
         u_grads, v_grads, p_grads, a_grads = self.compute_gradients(x, y, t)
         u, u_x, u_y, u_t, u_xx, u_yy = u_grads
@@ -229,8 +169,8 @@ class TwoPhasePinn(tf.keras.Model):
 
         return PDE_m, PDE_u, PDE_v, PDE_a
 
-    @tf.function(**TF_FUNCTION_SETTINGS)
-    def compute_loss(self, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM):
+    @tf.function
+    def compute_loss(self, data_A, data_PDE, data_N, data_EW, data_NSEW):
         # Unpack tensor tuples
         x_A, y_A, t_A, a_A = data_A
         x_PDE, y_PDE, t_PDE = data_PDE
@@ -271,19 +211,17 @@ class TwoPhasePinn(tf.keras.Model):
 
         loss_PDE = tf.tensordot(tf.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a]), self.loss_weights_PDE, 1)
 
-        loss_geom = self.compute_geom_loss(data_GEOM, debug=False)
+        # Total Loss
+        total_loss = loss_a_A + loss_BC + loss_PDE
 
-        # === Combine all losses ===
-        total_loss = loss_a_A + loss_BC + loss_PDE + loss_geom
-
-        return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a, loss_geom
+        return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a
 
 
-    @tf.function(**TF_FUNCTION_SETTINGS)
-    def train_step(self, optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM):
+    @tf.function
+    def train_step(self, optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW):
         with tf.GradientTape() as tape:
             # Pass the tensor tuples directly to compute_loss
-            losses = self.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
+            losses = self.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW)
             total_loss = losses[0]
 
         gradients = tape.gradient(total_loss, self.trainable_variables)
@@ -331,15 +269,6 @@ def get_proportional_batch_sizes(total_batch_size, training_data, logger):
             batch_sizes[key] = math.ceil(proportion * total_batch_size)
         else:
             batch_sizes[key] = 0
-
-    batch_sizes = {
-        'A': max(16, batch_sizes['A']),
-        'PDE': max(32, batch_sizes['PDE']),
-        'N': max(16, batch_sizes['N']),
-        'EW': max(16, batch_sizes['EW']),
-        'NSEW': max(16, batch_sizes['NSEW']),
-        'GEOM': max(16, batch_sizes['GEOM'])
-    }
             
     logger.info(f"Total samples: {num_samples_total}, Desired batch size: {total_batch_size}")
     logger.info(f"Calculated num_batches: {num_batches}, Proportional batch sizes: {batch_sizes}")
@@ -367,7 +296,6 @@ def main():
     #4 points vert 5 points horiz entire domain, compute theorems in each region
     #eventually nice: for any arb point in domain compute region around it
     training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
-    training_data['A']['a_A'] = (training_data['A']['a_A'] * 2.0) - 1.0
 
     # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
@@ -421,7 +349,7 @@ def main():
     loss_weights_PDE = [1.0, 10.0, 10.0, 1.0]
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
-    checkpoint_interval = 1
+    checkpoint_interval = 50
     num_of_batches = 20
     
     num_samples_total = sum(len(df) for df in training_data.values())
@@ -438,7 +366,6 @@ def main():
     history_loss_a = []
     history_loss_f_uv = []
     history_loss_f_ma = []
-    history_loss_geom = []
     
     def to_tensor_tuple(df, columns):
         return tuple(tf.constant(df[c].to_numpy().reshape(-1, 1), dtype=tf.float32) for c in columns)
@@ -470,17 +397,16 @@ def main():
                 data_N = to_tensor_tuple(batch_dict['N'], batch_dict['N'].columns)
                 data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
                 data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
-                data_GEOM = to_tensor_tuple(batch_dict['GEOM'], batch_dict['GEOM'].columns)
-                batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
+                
+                batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW)
                 epoch_losses.append([l.numpy() for l in batch_loss_values])
 
             avg_losses = np.mean(epoch_losses, axis=0)
-            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a, loss_geom = avg_losses
+            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_losses
 
             history_loss_a.append(loss_a)
             history_loss_f_uv.append(loss_u + loss_v)
             history_loss_f_ma.append(loss_m + loss_pde_a)
-            history_loss_geom.append(loss_geom)
             
             if epoch % checkpoint_interval == 0:
                 current_time = time.time()
@@ -489,7 +415,6 @@ def main():
                 log_msg = f"Epoch: {epoch}/{epochs} - Time: {time_for_epoch:.2f}s - Loss: {total_loss:.4e}"
                 log_msg += f" | a: {loss_a:.4e}, BC: {loss_bc:.4e}, m: {loss_m:.4e}"
                 log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, pde_a: {loss_pde_a:.4e}"
-                log_msg += f" geom: {loss_geom:.4e}"
                 logger.info(log_msg)
             
             # Saves weights every 'checkpoint_interval' epochs, overwriting the previous file.
@@ -537,15 +462,14 @@ def main():
         data_N = to_tensor_tuple(batch_dict['N'], batch_dict['N'].columns)
         data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
         data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
-        data_GEOM = to_tensor_tuple(batch_dict['GEOM'], batch_dict['GEOM'].columns)
         
         # Compute loss for the batch without training
-        batch_losses = pinn.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
+        batch_losses = pinn.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW)
         final_evaluation_losses.append([l.numpy() for l in batch_losses])
 
     # Calculate the mean loss across all batches
     avg_final_losses = np.mean(final_evaluation_losses, axis=0)
-    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a, loss_geom = avg_final_losses
+    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_final_losses
 
     logger.info("--- Final Loss Breakdown ---")
     logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")
@@ -554,7 +478,6 @@ def main():
     logger.info(f"MSE_f,u                    : {loss_u:.4e}")
     logger.info(f"MSE_f,v                    : {loss_v:.4e}")
     logger.info(f"MSE_f,a                    : {loss_pde_a:.4e}")
-    logger.info(f"MSE_GEOM                    : {loss_geom:.4e}")
     logger.info("----------------------------\n")
 
     # --- Plotting and Saving History (No changes needed here) ---
@@ -590,16 +513,6 @@ def main():
     plt.yscale('log')
     plt.grid(True, which="both", ls="--")
     plt.savefig(os.path.join(dirname, 'loss_history_conservation_ma.png'))
-
-    # Plot 4: MSE GEOM
-    plt.figure(figsize=(10, 6))
-    plt.plot(epochs_range, history_loss_geom)
-    plt.title(f'MSE of Geometric Loss Grad vs Int. Norm. vs. Epochs ({adaptive_mode} - {activation_choice})')
-    plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss Geom')
-    plt.yscale('log')
-    plt.grid(True, which="both", ls="--")
-    plt.savefig(os.path.join(dirname, 'loss_history_geom.png'))
     
     plt.close('all') # Close all figures to free memory
     logger.info("Plots saved successfully.")
@@ -612,8 +525,7 @@ def main():
         'epoch': epochs_range,
         'MSE_alpha': history_loss_a,
         'MSE_f_uv': history_loss_f_uv,
-        'MSE_f_ma': history_loss_f_ma,
-        'MSE_geom': history_loss_geom
+        'MSE_f_ma': history_loss_f_ma
     })
     
     history_df.to_csv(history_filepath, index=False)
