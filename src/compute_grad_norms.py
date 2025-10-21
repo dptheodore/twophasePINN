@@ -47,7 +47,7 @@ def process_line(X, Y, grid_scale, levelset_t, intersections, orientation, fixed
 
         val_mid = interpn((Y, X), levelset_t, np.array([sample_point]),
                           method='linear', bounds_error=False, fill_value=1.0)[0]
-        if val_mid < ISO_VALUE:
+        if val_mid > ISO_VALUE:
             total_len += seg_len
             inside_intervals.append((a, b))
 
@@ -60,7 +60,7 @@ def process_line(X, Y, grid_scale, levelset_t, intersections, orientation, fixed
                                method='linear', bounds_error=False, fill_value=1.0)[0]
             right_val = interpn((Y, X), levelset_t, np.array([(fixed_coord, right_x)]),
                                 method='linear', bounds_error=False, fill_value=1.0)[0]
-            intersection_side_info[float(x)] = (left_val < ISO_VALUE, right_val < ISO_VALUE)
+            intersection_side_info[float(x)] = (left_val > ISO_VALUE, right_val > ISO_VALUE)
         else:
             lower_y = x - delta
             upper_y = x + delta
@@ -68,7 +68,7 @@ def process_line(X, Y, grid_scale, levelset_t, intersections, orientation, fixed
                                 method='linear', bounds_error=False, fill_value=1.0)[0]
             upper_val = interpn((Y, X), levelset_t, np.array([(upper_y, fixed_coord)]),
                                 method='linear', bounds_error=False, fill_value=1.0)[0]
-            intersection_side_info[float(x)] = (lower_val < ISO_VALUE, upper_val < ISO_VALUE)
+            intersection_side_info[float(x)] = (lower_val > ISO_VALUE, upper_val > ISO_VALUE)
 
     # compute span as bounding box of inside intervals (if any)
     if inside_intervals:
