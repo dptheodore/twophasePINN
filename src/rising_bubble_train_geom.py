@@ -10,7 +10,7 @@ import tensorflow as tf
 import numpy as np
 import pandas as pd
 import scipy.io
-from generate_points import get_training_data
+from generate_points_geom import get_training_data
 from utilities import NNCreator, writeToJSONFile 
 import time
 import math
@@ -223,69 +223,83 @@ class TwoPhasePinn(tf.keras.Model):
     
         tf.print("=== END DIAGNOSTICS ===")
     
-    def compute_geom_loss(self, data_GEOM, geom_weight=10.0, eps_soft=0.1, min_weight=0.05, debug=False):
+    def compute_geom_loss(self, data_GEOM, geom_weight=10.0, delta=0.005, eps_soft=0.1, min_weight=0.05, debug=False):
         """
-        Compute patch-level geometric loss for PINN with stable soft-contour weighting.
-    
-        data_GEOM: xg, yg, tg, grad_x_gt, grad_y_gt, normal_x_gt, normal_y_gt
+        Differentiable geometric loss that approximates marching-squares-derived patch features.
+
+        data_GEOM: (xg, yg, tg, grad_x_gt, grad_y_gt, normal_x_gt, normal_y_gt)
+            Each point (xg, yg, tg) is the *center* of a small computation region.
+            grad_x_gt, grad_y_gt: total interface length fractions along left-right / bottom-top boundaries.
+            normal_x_gt, normal_y_gt: integrated interface normal from marching squares.
         """
         xg, yg, tg, grad_x_gt, grad_y_gt, normal_x_gt, normal_y_gt = data_GEOM
-    
-        # --- Predicted field ---
-        with tf.GradientTape(persistent=True) as tape:
-            tape.watch([xg, yg])
-            pred_u, pred_v, pred_p, pred_a = self.call(tf.concat([xg, yg, tg], axis=1))
-    
-        grad_x_pred, grad_y_pred = tape.gradient(pred_a, [xg, yg])
-        del tape
-    
-        # --- Soft-contour weighting ---
-        weight = tf.exp(-tf.square(pred_a) / (2.0 * eps_soft**2))  # [N,1]
-        weight = tf.reshape(weight, [-1])                           # [N]
-        weight = tf.maximum(weight, min_weight)                     # prevent vanishing
-    
-        # --- Per-point gradient MSE ---
-        grad_x_pred_s = tf.squeeze(grad_x_pred, -1)
-        grad_y_pred_s = tf.squeeze(grad_y_pred, -1)
+
+        # -----------------------------------------
+        # 1. Evaluate predicted a at offset positions
+        # -----------------------------------------
+        pts_left   = tf.concat([xg - delta, yg, tg], axis=1)
+        pts_right  = tf.concat([xg + delta, yg, tg], axis=1)
+        pts_bottom = tf.concat([xg, yg - delta, tg], axis=1)
+        pts_top    = tf.concat([xg, yg + delta, tg], axis=1)
+
+        _, _, _, a_left   = self.call(pts_left)
+        _, _, _, a_right  = self.call(pts_right)
+        _, _, _, a_bottom = self.call(pts_bottom)
+        _, _, _, a_top    = self.call(pts_top)
+
+        # -----------------------------------------
+        # 2. Approximate patch-level gradient & normal
+        # -----------------------------------------
+        grad_x_pred = a_right - a_left      # left–right difference
+        grad_y_pred = a_top - a_bottom      # bottom–top difference
+
+        # Optional magnitude-like version (use abs if you only care about interface length)
+        grad_vec_pred = tf.concat([grad_x_pred, grad_y_pred], axis=1)
+
+        # Predicted unit normal (opposite of ∇a)
+        norm_mag = tf.sqrt(grad_x_pred**2 + grad_y_pred**2 + 1e-12)
+        normal_pred = tf.concat([-grad_x_pred / norm_mag, -grad_y_pred / norm_mag], axis=1)
+
+        # -----------------------------------------
+        # 3. Soft-contour weighting (focus near interface)
+        # -----------------------------------------
+        # Evaluate a at center (used for weighting)
+        _, _, _, a_center = self.call(tf.concat([xg, yg, tg], axis=1))
+        weight = tf.exp(-tf.square(a_center) / (2.0 * eps_soft**2))
+        weight = tf.reshape(weight, [-1])
+        weight = tf.maximum(weight, min_weight)
+
+        # -----------------------------------------
+        # 4. Compute losses
+        # -----------------------------------------
         grad_x_gt_s = tf.squeeze(grad_x_gt, -1)
         grad_y_gt_s = tf.squeeze(grad_y_gt, -1)
-    
-        loss_geom_vec = geom_weight * tf.reduce_mean(
-            weight * (tf.square(grad_x_pred_s - grad_x_gt_s) + tf.square(grad_y_pred_s - grad_y_gt_s))
+        grad_vec_gt = tf.stack([grad_x_gt_s, grad_y_gt_s], axis=1)
+
+        normal_x_gt_s = tf.squeeze(normal_x_gt, -1)
+        normal_y_gt_s = tf.squeeze(normal_y_gt, -1)
+        normal_gt = tf.stack([normal_x_gt_s, normal_y_gt_s], axis=1)
+
+        # Weighted MSE losses
+        w2 = tf.expand_dims(weight, axis=1)
+
+        loss_grad_vec = geom_weight * tf.reduce_mean(
+            w2 * tf.square(grad_vec_pred - grad_vec_gt)
         )
-    
-        # --- Integrated normals ---
-        normal_pred = tf.stack([grad_x_pred_s, grad_y_pred_s], axis=1)
-        normal_pred_unit = normal_pred / (tf.norm(normal_pred, axis=1, keepdims=True) + 1e-12)
-    
-        normal_gt = tf.stack([-tf.squeeze(normal_x_gt, -1), -tf.squeeze(normal_y_gt, -1)], axis=1)
-        normal_gt_unit = normal_gt / (tf.norm(normal_gt, axis=1, keepdims=True) + 1e-12)
-    
-        weight_exp = tf.broadcast_to(weight[:, None], tf.shape(normal_pred_unit))
-        loss_geom_normal = geom_weight * tf.reduce_mean(
-            weight_exp * tf.square(normal_pred_unit - normal_gt_unit)
+
+        loss_normal = geom_weight * tf.reduce_mean(
+            w2 * tf.square(normal_pred - normal_gt)
         )
-    
-        # --- Combine losses ---
-        loss_geom = loss_geom_vec + loss_geom_normal
-    
+
+        loss_geom = loss_grad_vec + loss_normal
+
         if debug:
-            tf.print("=== GEOM DIAGNOSTICS ===")
-            tf.print("shapes: pred_a", tf.shape(pred_a),
-                     "grad_x_pred", tf.shape(grad_x_pred),
-                     "grad_y_pred", tf.shape(grad_y_pred))
-            tf.print("xg range:", tf.reduce_min(xg), tf.reduce_max(xg),
-                     "yg range:", tf.reduce_min(yg), tf.reduce_max(yg))
-            tf.print("pred_a mean/std:", tf.reduce_mean(pred_a), tf.math.reduce_std(pred_a))
-            tf.print("grad_vec_pred mean:", tf.reduce_mean(grad_x_pred_s), tf.reduce_mean(grad_y_pred_s))
-            tf.print("grad_vec_gt mean  :", tf.reduce_mean(grad_x_gt_s), tf.reduce_mean(grad_y_gt_s))
-            tf.print("loss_geom_vec:", loss_geom_vec)
-            tf.print("loss_geom_normal:", loss_geom_normal)
-            tf.print("loss_geom (combined):", loss_geom)
-            tf.print("weight mean/max:", tf.reduce_mean(weight), tf.reduce_max(weight))
-            tf.print("=== END DIAGNOSTICS ===")
-    
+            tf.print("GeomLoss:", loss_geom,
+                     " | grad_vec:", tf.reduce_mean(tf.abs(grad_vec_pred - grad_vec_gt)),
+                     " | normal:", tf.reduce_mean(tf.abs(normal_pred - normal_gt)))
+
         return loss_geom
+
 
 
 
@@ -522,7 +536,7 @@ def main():
     #4 points vert 5 points horiz entire domain, compute theorems in each region
     #eventually nice: for any arb point in domain compute region around it
     training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
-    training_data['A']['a_A'] = (training_data['A']['a_A'] * 2.0) - 1.0
+    #training_data['A']['a_A'] = (training_data['A']['a_A'] * 2.0) - 1.0
 
     # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
@@ -576,8 +590,8 @@ def main():
     loss_weights_PDE = [1.0, 10.0, 10.0, 1.0]
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
-    checkpoint_interval = 50
-    num_of_batches = 5
+    checkpoint_interval = 10
+    num_of_batches = 10
     
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches) 
@@ -586,7 +600,7 @@ def main():
                       adaptive_activation_n, adaptive_activation_init, use_adaptive_activation,
                       loss_weights_PDE, mu, sigma, g, rho, u_ref, L_ref)
 
-    #pinn.nn.load_weights('initial_weights.h5')
+    pinn.nn.load_weights('initial_weights.h5')
 
     start_total = time.time()
     
