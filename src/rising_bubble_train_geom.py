@@ -222,90 +222,199 @@ class TwoPhasePinn(tf.keras.Model):
             tf.print("loss_bc:", loss_bc)
     
         tf.print("=== END DIAGNOSTICS ===")
-    
-    def compute_geom_loss(self, data_GEOM, geom_weight=10.0, delta=0.005, eps_soft=0.1, min_weight=0.05, debug=False):
-        """
-        Differentiable geometric loss that approximates marching-squares-derived patch features.
 
-        data_GEOM: (xg, yg, tg, grad_x_gt, grad_y_gt, normal_x_gt, normal_y_gt)
-            Each point (xg, yg, tg) is the *center* of a small computation region.
-            grad_x_gt, grad_y_gt: total interface length fractions along left-right / bottom-top boundaries.
-            normal_x_gt, normal_y_gt: integrated interface normal from marching squares.
+    def debug_geom_visual(self, data_GEOM):
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        xg, yg, tg, grad_x_gt, grad_y_gt, normal_x_gt, normal_y_gt = data_GEOM
+
+        # Run model to get predicted gradients
+        delta = 0.5 * 0.00390625  # or whatever your grid spacing is
+        _, _, _, a_left   = self.call(tf.concat([xg - delta, yg, tg], axis=1))
+        _, _, _, a_right  = self.call(tf.concat([xg + delta, yg, tg], axis=1))
+        _, _, _, a_bottom = self.call(tf.concat([xg, yg - delta, tg], axis=1))
+        _, _, _, a_top    = self.call(tf.concat([xg, yg + delta, tg], axis=1))
+
+        grad_x_pred = (a_right - a_left).numpy().squeeze()
+        grad_y_pred = (a_top - a_bottom).numpy().squeeze()
+
+        grad_x_gt = grad_x_gt.numpy().squeeze()
+        grad_y_gt = grad_y_gt.numpy().squeeze()
+        xg = xg.numpy().squeeze()
+        yg = yg.numpy().squeeze()
+
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.quiver(xg, yg, grad_x_gt, grad_y_gt, angles="xy", scale_units="xy", scale=1)
+        plt.title("Ground Truth Grad Vecs")
+
+        plt.subplot(1, 2, 2)
+        plt.quiver(xg, yg, grad_x_pred, grad_y_pred, angles="xy", scale_units="xy", scale=1)
+        plt.title("Predicted Grad Vecs")
+
+        plt.gca().invert_yaxis()  # optional if your Y goes downward
+        plt.show()
+
+
+
+    # def debug_geom_visual(xg, yg, grad_vec_pred, grad_vec_gt, stride=4, title="Geom Debug"):
+    #     """
+    #     Visualize predicted vs ground-truth gradient fields.
+    #     Can be called from within your geom loss computation for debugging.
+
+    #     Args:
+    #         xg, yg: 1D or 2D arrays of coordinates (used for plotting).
+    #         grad_vec_pred: [H, W, 2] predicted gradients (Tensor or np array).
+    #         grad_vec_gt:   [H, W, 2] ground-truth gradients (Tensor or np array).
+    #         stride: int, subsampling step for quiver plot.
+    #         title: figure title.
+    #     """
+    #     # --- Convert tensors to numpy ---
+    #     if hasattr(grad_vec_pred, "numpy"):
+    #         grad_vec_pred = grad_vec_pred.numpy()
+    #     if hasattr(grad_vec_gt, "numpy"):
+    #         grad_vec_gt = grad_vec_gt.numpy()
+
+    #     # --- Compute magnitudes and normalized directions ---
+    #     grad_mag_pred = np.linalg.norm(grad_vec_pred, axis=-1)
+    #     grad_mag_gt = np.linalg.norm(grad_vec_gt, axis=-1)
+    #     eps = 1e-8
+    #     grad_dir_pred = grad_vec_pred / (grad_mag_pred[..., None] + eps)
+    #     grad_dir_gt = grad_vec_gt / (grad_mag_gt[..., None] + eps)
+
+    #     # --- Build coordinate grid for quiver ---
+    #     if xg.ndim == 1 and yg.ndim == 1:
+    #         X, Y = np.meshgrid(xg, yg)
+    #     else:
+    #         X, Y = xg, yg
+
+    #     # --- Make figure ---
+    #     fig, axs = plt.subplots(2, 3, figsize=(12, 8))
+    #     fig.suptitle(title, fontsize=14)
+
+    #     # Magnitude maps
+    #     axs[0,0].imshow(grad_mag_gt, cmap='viridis')
+    #     axs[0,0].set_title("GT |∇φ|")
+
+    #     axs[0,1].imshow(grad_mag_pred, cmap='viridis')
+    #     axs[0,1].set_title("Pred |∇φ|")
+
+    #     axs[0,2].imshow(np.abs(grad_mag_pred - grad_mag_gt), cmap='inferno')
+    #     axs[0,2].set_title("Abs diff |∇φ|")
+
+    #     # Direction fields
+    #     axs[1,0].quiver(X[::stride,::stride], Y[::stride,::stride],
+    #                     grad_dir_gt[::stride,::stride,0],
+    #                     -grad_dir_gt[::stride,::stride,1], color='cyan', scale=30)
+    #     axs[1,0].set_title("GT ∇φ direction")
+
+    #     axs[1,1].quiver(X[::stride,::stride], Y[::stride,::stride],
+    #                     grad_dir_pred[::stride,::stride,0],
+    #                     -grad_dir_pred[::stride,::stride,1], color='orange', scale=30)
+    #     axs[1,1].set_title("Pred ∇φ direction")
+
+    #     dir_diff = np.sum((grad_dir_pred - grad_dir_gt)**2, axis=-1)
+    #     axs[1,2].imshow(dir_diff, cmap='magma')
+    #     axs[1,2].set_title("Direction mismatch")
+
+    #     for ax in axs.flat:
+    #         ax.axis("off")
+
+    #     plt.tight_layout()
+    #     plt.show()
+
+
+    def compute_geom_loss(self, data_GEOM, geom_weight=1e1, delta=0.5 * 0.00390625,
+                          eps_soft=0.1, min_weight=0.05, huber_delta=1e-3, debug=False):
+        """
+        Stabilized geometric loss:
+        - uses central-difference divided by 2*delta (correct derivative scale)
+        - compares magnitudes for grad_vec (use abs if grad_vec is a length)
+        - normalizes pred and GT normals before angular comparison
+        - uses Huber loss (robust) instead of raw MSE
+        - geom_weight should start small (1e-3..1e-2) and be ramped up in training
         """
         xg, yg, tg, grad_x_gt, grad_y_gt, normal_x_gt, normal_y_gt = data_GEOM
 
-        # -----------------------------------------
-        # 1. Evaluate predicted a at offset positions
-        # -----------------------------------------
+        # ---- 1) Evaluate predicted a at offset positions ----
         pts_left   = tf.concat([xg - delta, yg, tg], axis=1)
         pts_right  = tf.concat([xg + delta, yg, tg], axis=1)
         pts_bottom = tf.concat([xg, yg - delta, tg], axis=1)
         pts_top    = tf.concat([xg, yg + delta, tg], axis=1)
 
-        _, _, _, a_left   = self.call(pts_left)
-        _, _, _, a_right  = self.call(pts_right)
-        _, _, _, a_bottom = self.call(pts_bottom)
-        _, _, _, a_top    = self.call(pts_top)
+        # inference (training mode default keeps BN if any; you can force training=False if desired)
+        _, _, _, a_left   = self(pts_left, training=False)
+        _, _, _, a_right  = self(pts_right, training=False)
+        _, _, _, a_bottom = self(pts_bottom, training=False)
+        _, _, _, a_top    = self(pts_top, training=False)
 
-        # -----------------------------------------
-        # 2. Approximate patch-level gradient & normal
-        # -----------------------------------------
-        grad_x_pred = a_right - a_left      # left–right difference
-        grad_y_pred = a_top - a_bottom      # bottom–top difference
+        # ---- 2) Central-difference derivative estimate (correct scale) ----
+        # d a / dx ≈ (a(x+delta) - a(x-delta)) / (2*delta)
+        denom = tf.cast(2.0 * delta, tf.float32)
+        grad_x_pred = (a_right - a_left) / denom
+        grad_y_pred = (a_top - a_bottom) / denom
 
-        # Optional magnitude-like version (use abs if you only care about interface length)
-        grad_vec_pred = tf.concat([grad_x_pred, grad_y_pred], axis=1)
+        # Produce grad_vec_pred as magnitudes if GT is length-like; use abs if appropriate
+        # If your grad_vec_gt are positive lengths, compare magnitudes:
+        grad_vec_pred_mag = tf.concat([tf.abs(grad_x_pred), tf.abs(grad_y_pred)], axis=1)
 
-        # Predicted unit normal (opposite of ∇a)
-        norm_mag = tf.sqrt(grad_x_pred**2 + grad_y_pred**2 + 1e-12)
+        # ---- 3) Predicted normal ----
+        # Use derivative field for normal. Guard tiny norms with epsilon.
+        norm_mag = tf.sqrt(tf.square(grad_x_pred) + tf.square(grad_y_pred) + 1e-8)
         normal_pred = tf.concat([-grad_x_pred / norm_mag, -grad_y_pred / norm_mag], axis=1)
 
-        # -----------------------------------------
-        # 3. Soft-contour weighting (focus near interface)
-        # -----------------------------------------
-        # Evaluate a at center (used for weighting)
-        _, _, _, a_center = self.call(tf.concat([xg, yg, tg], axis=1))
+        # ---- 4) Soft-contour weighting (use clipped a_center for stability) ----
+        _, _, _, a_center = self(tf.concat([xg, yg, tg], axis=1), training=False)
+        a_center = tf.clip_by_value(a_center, 0.0, 1.0)  # ensure 0..1
         weight = tf.exp(-tf.square(a_center) / (2.0 * eps_soft**2))
         weight = tf.reshape(weight, [-1])
         weight = tf.maximum(weight, min_weight)
+        w2 = tf.expand_dims(weight, axis=1)
 
-        # -----------------------------------------
-        # 4. Compute losses
-        # -----------------------------------------
+        # ---- 5) Prepare GT and normalization ----
         grad_x_gt_s = tf.squeeze(grad_x_gt, -1)
         grad_y_gt_s = tf.squeeze(grad_y_gt, -1)
-        grad_vec_gt = tf.stack([grad_x_gt_s, grad_y_gt_s], axis=1)
+        grad_vec_gt_mag = tf.concat([grad_x_gt_s[:, None], grad_y_gt_s[:, None]], axis=1)
 
+        # Normalize grad vectors to comparable scale if GTs are much larger/smaller:
+        # compute median magnitude and use it to normalize (robust)
+        pred_mag = tf.sqrt(tf.reduce_sum(tf.square(grad_vec_pred_mag), axis=1, keepdims=True)) + 1e-12
+        gt_mag = tf.sqrt(tf.reduce_sum(tf.square(grad_vec_gt_mag), axis=1, keepdims=True)) + 1e-12
+
+        # optionally normalize per-point to unit magnitude before direction comparison,
+        # but for lengths we want to compare magnitudes so we skip direction normalization here.
+
+        # ---- 6) Huber loss on grad magnitudes (robust to outliers) ----
+        # Huber: 1/2*x^2 if |x|<=d else d*(|x|-0.5*d)
+        diff_grad = grad_vec_pred_mag - grad_vec_gt_mag
+        abs_diff = tf.abs(diff_grad)
+        huber_mask = tf.cast(abs_diff <= huber_delta, tf.float32)
+        loss_grad_vec_point = huber_mask * 0.5 * tf.square(diff_grad) + (1.0 - huber_mask) * (huber_delta * (abs_diff - 0.5 * huber_delta))
+        loss_grad_vec = tf.reduce_mean(w2 * tf.reduce_sum(loss_grad_vec_point, axis=1, keepdims=True))
+
+        # ---- 7) Normal (direction) loss: use cosine distance (robust) ----
         normal_x_gt_s = tf.squeeze(normal_x_gt, -1)
         normal_y_gt_s = tf.squeeze(normal_y_gt, -1)
         normal_gt = tf.stack([normal_x_gt_s, normal_y_gt_s], axis=1)
+        # normalize GT normals
+        gt_norms = tf.sqrt(tf.reduce_sum(tf.square(normal_gt), axis=1, keepdims=True)) + 1e-12
+        normal_gt_unit = normal_gt / gt_norms
+        # clip pred to avoid NaNs
+        normal_pred_unit = normal_pred / (tf.sqrt(tf.reduce_sum(tf.square(normal_pred), axis=1, keepdims=True)) + 1e-12)
 
-        # Weighted MSE losses
-        w2 = tf.expand_dims(weight, axis=1)
+        # cosine similarity -> turn into a distance in [0,2]
+        cos_sim = tf.reduce_sum(normal_pred_unit * normal_gt_unit, axis=1, keepdims=True)
+        cos_sim = tf.clip_by_value(cos_sim, -1.0, 1.0)
+        # angle distance (robust): 1 - cos_sim is fine and differentiable
+        loss_normal_point = 1.0 - cos_sim
+        loss_normal = tf.reduce_mean(w2 * loss_normal_point)
 
-        loss_grad_vec = geom_weight * tf.reduce_mean(
-            w2 * tf.square(grad_vec_pred - grad_vec_gt)
-        )
+        # ---- 8) Combine with geom_weight (keep geom_weight small initially) ----
+        loss_geom = geom_weight * (loss_grad_vec + loss_normal)
 
-        loss_normal = geom_weight * tf.reduce_mean(
-            w2 * tf.square(normal_pred - normal_gt)
-        )
-
-        loss_geom = loss_grad_vec + loss_normal
-
-        if debug:
-            tf.print("GeomLoss:", loss_geom,
-                     " | grad_vec:", tf.reduce_mean(tf.abs(grad_vec_pred - grad_vec_gt)),
-                     " | normal:", tf.reduce_mean(tf.abs(normal_pred - normal_gt)))
 
         return loss_geom
-
-
-
-
-
-
-
 
     def _get_activation_function_dict(self, hidden_layers, activation_functions, adaptive_activation_coeff, adaptive_activation_n):
         """Helper to create the activation dictionary for NNCreator."""
@@ -321,7 +430,7 @@ class TwoPhasePinn(tf.keras.Model):
                         activation_dict[layer_no][1] = self.ad_act_coeff[coeff_name]
         return activation_dict
 
-    def call(self, inputs):
+    def call(self, inputs, training=True):
         # The model built by NNCreator is now stored in self.nn
         return self.nn(inputs)
 
@@ -590,8 +699,8 @@ def main():
     loss_weights_PDE = [1.0, 10.0, 10.0, 1.0]
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
-    checkpoint_interval = 10
-    num_of_batches = 10
+    checkpoint_interval = 1
+    num_of_batches = 20
     
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches) 
@@ -640,6 +749,7 @@ def main():
                 data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
                 data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
                 data_GEOM = to_tensor_tuple(batch_dict['GEOM'], batch_dict['GEOM'].columns)
+                pinn.debug_geom_visual(data_GEOM)
                 batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
                 epoch_losses.append([l.numpy() for l in batch_loss_values])
 
