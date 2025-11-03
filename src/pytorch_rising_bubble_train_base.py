@@ -12,7 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import pandas as pd
 import scipy.io
-from generate_points_geom import get_training_data
+from generate_points import get_training_data
 from pytorch_utilities import NNCreator, writeToJSONFile
 import time
 import math
@@ -250,75 +250,7 @@ class TwoPhasePinn(nn.Module):
         
         return PDE_m, PDE_u, PDE_v, PDE_a
     
-    def compute_geom_loss(self, data_GEOM, geom_weight=1e1, delta=0.5 * 0.00390625,
-                          eps_soft=0.1, min_weight=0.05, huber_delta=1e-3, debug=False):
-        """Compute stabilized geometric loss"""
-        xg, yg, tg, grad_x_gt, grad_y_gt, normal_x_gt, normal_y_gt = data_GEOM
-        
-        # Evaluate at offset positions
-        pts_left = torch.cat([xg - delta, yg, tg], dim=1)
-        pts_right = torch.cat([xg + delta, yg, tg], dim=1)
-        pts_bottom = torch.cat([xg, yg - delta, tg], dim=1)
-        pts_top = torch.cat([xg, yg + delta, tg], dim=1)
-        
-        with torch.no_grad():
-            _, _, _, a_left = self(pts_left)
-            _, _, _, a_right = self(pts_right)
-            _, _, _, a_bottom = self(pts_bottom)
-            _, _, _, a_top = self(pts_top)
-        
-        # Central difference derivative
-        denom = 2.0 * delta
-        grad_x_pred = (a_right - a_left) / denom
-        grad_y_pred = (a_top - a_bottom) / denom
-        
-        grad_vec_pred_mag = torch.cat([torch.abs(grad_x_pred), torch.abs(grad_y_pred)], dim=1)
-        
-        # Predicted normal
-        norm_mag = torch.sqrt(grad_x_pred**2 + grad_y_pred**2 + 1e-8)
-        normal_pred = torch.cat([-grad_x_pred / norm_mag, -grad_y_pred / norm_mag], dim=1)
-        
-        # Soft-contour weighting
-        _, _, _, a_center = self(torch.cat([xg, yg, tg], dim=1))
-        a_center = torch.clamp(a_center, 0.0, 1.0)
-        weight = torch.exp(-a_center**2 / (2.0 * eps_soft**2))
-        weight = weight.reshape(-1)
-        weight = torch.maximum(weight, torch.tensor(min_weight, device=device))
-        w2 = weight.unsqueeze(1)
-        
-        # Prepare GT
-        grad_x_gt_s = grad_x_gt.squeeze(-1)
-        grad_y_gt_s = grad_y_gt.squeeze(-1)
-        grad_vec_gt_mag = torch.cat([grad_x_gt_s.unsqueeze(1), grad_y_gt_s.unsqueeze(1)], dim=1)
-        
-        # Huber loss on gradients
-        diff_grad = grad_vec_pred_mag - grad_vec_gt_mag
-        abs_diff = torch.abs(diff_grad)
-        huber_mask = (abs_diff <= huber_delta).float()
-        loss_grad_vec_point = huber_mask * 0.5 * diff_grad**2 + \
-                              (1.0 - huber_mask) * (huber_delta * (abs_diff - 0.5 * huber_delta))
-        loss_grad_vec = torch.mean(w2 * loss_grad_vec_point.sum(dim=1, keepdim=True))
-        
-        # Normal (direction) loss
-        normal_x_gt_s = normal_x_gt.squeeze(-1)
-        normal_y_gt_s = normal_y_gt.squeeze(-1)
-        normal_gt = torch.stack([normal_x_gt_s, normal_y_gt_s], dim=1)
-        
-        gt_norms = torch.sqrt((normal_gt**2).sum(dim=1, keepdim=True)) + 1e-12
-        normal_gt_unit = normal_gt / gt_norms
-        
-        normal_pred_unit = normal_pred / (torch.sqrt((normal_pred**2).sum(dim=1, keepdim=True)) + 1e-12)
-        
-        cos_sim = (normal_pred_unit * normal_gt_unit).sum(dim=1, keepdim=True)
-        cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
-        loss_normal_point = 1.0 - cos_sim
-        loss_normal = torch.mean(w2 * loss_normal_point)
-        
-        loss_geom = geom_weight * (loss_grad_vec + loss_normal)
-        
-        return loss_geom
-    
-    def compute_loss(self, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM):
+    def compute_loss(self, data_A, data_PDE, data_N, data_EW, data_NSEW):
         """Compute total loss"""
         x_A, y_A, t_A, a_A = data_A
         x_PDE, y_PDE, t_PDE = data_PDE
@@ -360,16 +292,14 @@ class TwoPhasePinn(nn.Module):
         loss_PDE = torch.dot(torch.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a]), 
                             self.loss_weights_PDE)
         
-        loss_geom = self.compute_geom_loss(data_GEOM, geom_weight=1e1, debug=False)
+        total_loss = loss_a_A + loss_BC + loss_PDE
         
-        total_loss = loss_a_A + loss_BC + loss_PDE + loss_geom
-        
-        return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a, loss_geom
+        return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a
     
-    def train_step(self, optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM):
+    def train_step(self, optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW):
         """Single training step"""
         optimizer.zero_grad()
-        losses = self.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
+        losses = self.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW)
         total_loss = losses[0]
         total_loss.backward()
         optimizer.step()
@@ -426,8 +356,7 @@ def get_proportional_batch_sizes(total_batch_size, training_data, logger):
         'PDE': max(32, batch_sizes['PDE']),
         'N': max(16, batch_sizes['N']),
         'EW': max(16, batch_sizes['EW']),
-        'NSEW': max(16, batch_sizes['NSEW']),
-        'GEOM': max(16, batch_sizes['GEOM'])
+        'NSEW': max(16, batch_sizes['NSEW'])
     }
     
     logger.info(f"Total samples: {num_samples_total}, Desired batch size: {total_batch_size}")
@@ -523,7 +452,6 @@ def main():
     history_loss_a = []
     history_loss_f_uv = []
     history_loss_f_ma = []
-    history_loss_geom = []
     
     optimizer = optim.Adam(pinn.parameters(), lr=learning_rates[0])
     current_best_total_loss = float('inf')
@@ -559,19 +487,17 @@ def main():
                 data_N = to_tensor_tuple(batch_dict['N'], batch_dict['N'].columns)
                 data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
                 data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
-                data_GEOM = to_tensor_tuple(batch_dict['GEOM'], batch_dict['GEOM'].columns)
                 
                 batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, 
-                                                   data_EW, data_NSEW, data_GEOM)
+                                                   data_EW, data_NSEW)
                 epoch_losses.append([l.item() for l in batch_loss_values])
             
             avg_losses = np.mean(epoch_losses, axis=0)
-            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a, loss_geom = avg_losses
+            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_losses
             
             history_loss_a.append(loss_a)
             history_loss_f_uv.append(loss_u + loss_v)
             history_loss_f_ma.append(loss_m + loss_pde_a)
-            history_loss_geom.append(loss_geom)
             
             if epoch % checkpoint_interval == 0:
                 current_time = time.time()
@@ -580,7 +506,6 @@ def main():
                 log_msg = f"Epoch: {epoch}/{epochs} - Time: {time_for_epoch:.2f}s - Loss: {total_loss:.4e}"
                 log_msg += f" | a: {loss_a:.4e}, BC: {loss_bc:.4e}, m: {loss_m:.4e}"
                 log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, pde_a: {loss_pde_a:.4e}"
-                log_msg += f" geom: {loss_geom:.4e}"
                 logger.info(log_msg)
             
             # Save best model
@@ -630,13 +555,12 @@ def main():
             data_N = to_tensor_tuple(batch_dict['N'], batch_dict['N'].columns)
             data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
             data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
-            data_GEOM = to_tensor_tuple(batch_dict['GEOM'], batch_dict['GEOM'].columns)
             
-            batch_losses = pinn.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
+            batch_losses = pinn.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW)
             final_evaluation_losses.append([l.item() for l in batch_losses])
     
     avg_final_losses = np.mean(final_evaluation_losses, axis=0)
-    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a, loss_geom = avg_final_losses
+    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_final_losses
     
     logger.info("--- Final Loss Breakdown ---")
     logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")
@@ -645,7 +569,6 @@ def main():
     logger.info(f"MSE_f,u                    : {loss_u:.4e}")
     logger.info(f"MSE_f,v                    : {loss_v:.4e}")
     logger.info(f"MSE_f,a                    : {loss_pde_a:.4e}")
-    logger.info(f"MSE_GEOM                   : {loss_geom:.4e}")
     logger.info("----------------------------\n")
     
     # Plotting and saving history
@@ -682,16 +605,6 @@ def main():
     plt.grid(True, which="both", ls="--")
     plt.savefig(os.path.join(dirname, 'loss_history_conservation_ma.png'))
     
-    # Plot 4: MSE GEOM
-    plt.figure(figsize=(10, 6))
-    plt.plot(epochs_range, history_loss_geom)
-    plt.title(f'MSE of Geometric Loss vs. Epochs ({adaptive_mode} - {activation_choice})')
-    plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss Geom')
-    plt.yscale('log')
-    plt.grid(True, which="both", ls="--")
-    plt.savefig(os.path.join(dirname, 'loss_history_geom.png'))
-    
     plt.close('all')
     logger.info("Plots saved successfully.")
     
@@ -703,8 +616,7 @@ def main():
         'epoch': epochs_range,
         'MSE_alpha': history_loss_a,
         'MSE_f_uv': history_loss_f_uv,
-        'MSE_f_ma': history_loss_f_ma,
-        'MSE_geom': history_loss_geom
+        'MSE_f_ma': history_loss_f_ma
     })
     
     history_df.to_csv(history_filepath, index=False)
