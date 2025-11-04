@@ -174,7 +174,7 @@ class TwoPhasePinn(nn.Module):
         return torch.median(x_flat)
     
     def compute_gradients(self, x, y, t):
-        """Compute first and second order derivatives"""
+        """Compute first and second order derivatives - OPTIMIZED"""
         x = x.requires_grad_(True)
         y = y.requires_grad_(True)
         t = t.requires_grad_(True)
@@ -182,32 +182,35 @@ class TwoPhasePinn(nn.Module):
         inputs = torch.cat([x, y, t], dim=1)
         u, v, p, a = self(inputs)
         
-        # First order gradients
-        u_x = torch.autograd.grad(u, x, torch.ones_like(u), create_graph=True)[0]
-        u_y = torch.autograd.grad(u, y, torch.ones_like(u), create_graph=True)[0]
-        u_t = torch.autograd.grad(u, t, torch.ones_like(u), create_graph=True)[0]
+        # Compute all first-order gradients in one pass using create_graph=True
+        grad_outputs = torch.ones_like(u)
         
-        v_x = torch.autograd.grad(v, x, torch.ones_like(v), create_graph=True)[0]
-        v_y = torch.autograd.grad(v, y, torch.ones_like(v), create_graph=True)[0]
-        v_t = torch.autograd.grad(v, t, torch.ones_like(v), create_graph=True)[0]
+        # U gradients
+        u_grads = torch.autograd.grad(u, [x, y, t], grad_outputs, create_graph=True)
+        u_x, u_y, u_t = u_grads
         
-        p_x = torch.autograd.grad(p, x, torch.ones_like(p), create_graph=True)[0]
-        p_y = torch.autograd.grad(p, y, torch.ones_like(p), create_graph=True)[0]
+        # V gradients  
+        v_grads = torch.autograd.grad(v, [x, y, t], grad_outputs, create_graph=True)
+        v_x, v_y, v_t = v_grads
         
-        a_x = torch.autograd.grad(a, x, torch.ones_like(a), create_graph=True)[0]
-        a_y = torch.autograd.grad(a, y, torch.ones_like(a), create_graph=True)[0]
-        a_t = torch.autograd.grad(a, t, torch.ones_like(a), create_graph=True)[0]
+        # P gradients
+        p_grads = torch.autograd.grad(p, [x, y], grad_outputs, create_graph=True)
+        p_x, p_y = p_grads
         
-        # Second order gradients
-        u_xx = torch.autograd.grad(u_x, x, torch.ones_like(u_x), create_graph=True)[0]
-        u_yy = torch.autograd.grad(u_y, y, torch.ones_like(u_y), create_graph=True)[0]
+        # A gradients (including second order for curvature)
+        a_grads = torch.autograd.grad(a, [x, y, t], grad_outputs, create_graph=True)
+        a_x, a_y, a_t = a_grads
         
-        v_xx = torch.autograd.grad(v_x, x, torch.ones_like(v_x), create_graph=True)[0]
-        v_yy = torch.autograd.grad(v_y, y, torch.ones_like(v_y), create_graph=True)[0]
+        # Second order gradients - only compute what's needed
+        u_xx = torch.autograd.grad(u_x, x, grad_outputs, create_graph=True)[0]
+        u_yy = torch.autograd.grad(u_y, y, grad_outputs, create_graph=True)[0]
         
-        a_xx = torch.autograd.grad(a_x, x, torch.ones_like(a_x), create_graph=True)[0]
-        a_yy = torch.autograd.grad(a_y, y, torch.ones_like(a_y), create_graph=True)[0]
-        a_xy = torch.autograd.grad(a_x, y, torch.ones_like(a_x), create_graph=True)[0]
+        v_xx = torch.autograd.grad(v_x, x, grad_outputs, create_graph=True)[0]
+        v_yy = torch.autograd.grad(v_y, y, grad_outputs, create_graph=True)[0]
+        
+        a_xx = torch.autograd.grad(a_x, x, grad_outputs, create_graph=True)[0]
+        a_yy = torch.autograd.grad(a_y, y, grad_outputs, create_graph=True)[0]
+        a_xy = torch.autograd.grad(a_x, y, grad_outputs, create_graph=True)[0]
         
         return (u, u_x, u_y, u_t, u_xx, u_yy), \
                (v, v_x, v_y, v_t, v_xx, v_yy), \
@@ -296,14 +299,35 @@ class TwoPhasePinn(nn.Module):
         
         return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a
     
-    def train_step(self, optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW):
-        """Single training step"""
+    def train_step_with_accumulation(self, optimizer, data_batches, accumulation_steps):
+        """Training step with gradient accumulation across batches"""
         optimizer.zero_grad()
-        losses = self.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW)
-        total_loss = losses[0]
-        total_loss.backward()
+        
+        total_losses = None
+        num_accumulated = 0
+        
+        for batch_data in data_batches[:accumulation_steps]:
+            data_A, data_PDE, data_N, data_EW, data_NSEW = batch_data
+            
+            losses = self.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW)
+            
+            # Scale loss by accumulation steps
+            total_loss = losses[0] / accumulation_steps
+            total_loss.backward()
+            
+            # Accumulate losses for reporting
+            if total_losses is None:
+                total_losses = [l.item() for l in losses]
+            else:
+                total_losses = [tl + l.item() for tl, l in zip(total_losses, losses)]
+            
+            num_accumulated += 1
+        
         optimizer.step()
-        return losses
+        
+        # Average the accumulated losses
+        total_losses = [tl / num_accumulated for tl in total_losses]
+        return [torch.tensor(l) for l in total_losses]
 
 
 def setup_output_directory():
@@ -370,6 +394,31 @@ def to_tensor_tuple(df, columns):
                              dtype=torch.float32, device=device) for c in columns)
 
 
+def preload_training_data_to_gpu(training_data):
+    """Convert all training data to GPU tensors once"""
+    gpu_data = {}
+    lengths = {}
+    
+    for key, df in training_data.items():
+        gpu_data[key] = {}
+        for col in df.columns:
+            gpu_data[key][col] = torch.tensor(
+                df[col].to_numpy().reshape(-1, 1), 
+                dtype=torch.float32, 
+                device=device
+            )
+        lengths[key] = len(df)
+    
+    return gpu_data, lengths
+
+
+def get_batch_tensors(gpu_data, indices, key, start_idx, end_idx, columns=None):
+    """Extract batch from pre-loaded GPU tensors"""
+    batch_indices = indices[key][start_idx:end_idx]
+    if columns is None:
+        columns = gpu_data[key].keys()
+    return tuple(gpu_data[key][col][batch_indices] for col in columns)
+
 def main():
     """Main training loop"""
     dirname, logpath = setup_output_directory()
@@ -384,6 +433,11 @@ def main():
     
     training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
     
+    logger.info("Pre-loading training data to GPU...")
+    gpu_training_data, data_lengths = preload_training_data_to_gpu(training_data)
+    logger.info("Data loaded to GPU successfully.")
+    
+
     # NN Architecture and Hyperparameters
     no_layers = 8
     hidden_layers = [400] * no_layers
@@ -433,7 +487,7 @@ def main():
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
     checkpoint_interval = 10
-    num_of_batches = 20
+    num_of_batches = 15
     
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches)
@@ -441,6 +495,8 @@ def main():
     pinn = TwoPhasePinn(hidden_layers, activation_functions, adaptive_activation_coeff,
                        adaptive_activation_n, adaptive_activation_init, use_adaptive_activation,
                        loss_weights_PDE, mu, sigma, g, rho, u_ref, L_ref)
+    pinn = torch.compile(pinn, mode='reduce-overhead')  # or mode='max-autotune'
+
     
     # Load initial weights if available
     if os.path.exists('initial_weights.pth'):
@@ -467,30 +523,69 @@ def main():
                                                                      training_data, logger)
         start_checkpoint_time = time.time()
         
+        accumulation_steps = 3  # Add this near the top of main(), after num_of_batches
+
         for epoch in range(1, epochs + 1):
             epoch_losses = []
-            shuffled_data = {key: df.sample(frac=1).reset_index(drop=True) 
-                           for key, df in training_data.items()}
+            shuffled_indices = {
+                key: torch.randperm(data_lengths[key], device=device) 
+                for key in gpu_training_data.keys()
+            }
+            
+            optimizer.zero_grad()  # Zero once at start
+            accumulated_count = 0
             
             for b in range(num_batches):
-                batch_dict = {}
-                for key, df in shuffled_data.items():
-                    start_idx = b * prop_batch_sizes[key]
-                    end_idx = (b + 1) * prop_batch_sizes[key]
-                    batch_dict[key] = df.iloc[start_idx:end_idx]
+                data_A = get_batch_tensors(
+                    gpu_training_data, shuffled_indices, 'A',
+                    b * prop_batch_sizes['A'], 
+                    (b + 1) * prop_batch_sizes['A']
+                )
                 
-                if all(batch.empty for batch in batch_dict.values()):
-                    continue
+                data_PDE = get_batch_tensors(
+                    gpu_training_data, shuffled_indices, 'PDE',
+                    b * prop_batch_sizes['PDE'], 
+                    (b + 1) * prop_batch_sizes['PDE'],
+                    columns=['x_PDE', 'y_PDE', 't_PDE']
+                )
                 
-                data_A = to_tensor_tuple(batch_dict['A'], batch_dict['A'].columns)
-                data_PDE = to_tensor_tuple(batch_dict['PDE'], ['x_PDE', 'y_PDE', 't_PDE'])
-                data_N = to_tensor_tuple(batch_dict['N'], batch_dict['N'].columns)
-                data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
-                data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
+                data_N = get_batch_tensors(
+                    gpu_training_data, shuffled_indices, 'N',
+                    b * prop_batch_sizes['N'], 
+                    (b + 1) * prop_batch_sizes['N']
+                )
                 
-                batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, 
-                                                   data_EW, data_NSEW)
-                epoch_losses.append([l.item() for l in batch_loss_values])
+                # For EW, we need specific columns in specific order
+                ew_start = b * prop_batch_sizes['EW']
+                ew_end = (b + 1) * prop_batch_sizes['EW']
+                ew_indices = shuffled_indices['EW'][ew_start:ew_end]
+                data_EW = (
+                    gpu_training_data['EW']['x_E'][ew_indices],
+                    gpu_training_data['EW']['y_E'][ew_indices],
+                    gpu_training_data['EW']['t_EW'][ew_indices],
+                    gpu_training_data['EW']['x_W'][ew_indices],
+                    gpu_training_data['EW']['y_W'][ew_indices]
+                )
+                
+                data_NSEW = get_batch_tensors(
+                    gpu_training_data, shuffled_indices, 'NSEW',
+                    b * prop_batch_sizes['NSEW'], 
+                    (b + 1) * prop_batch_sizes['NSEW']
+                )
+                
+                # Forward and backward (accumulate gradients)
+                losses = pinn.compute_loss(data_A, data_PDE, data_N, data_EW, data_NSEW)
+                total_loss = losses[0] / accumulation_steps  # Scale loss
+                total_loss.backward()  # Accumulate gradients
+                
+                epoch_losses.append([l.item() for l in losses])
+                accumulated_count += 1
+                
+                # Only step optimizer every accumulation_steps batches
+                if accumulated_count >= accumulation_steps or (b + 1) == num_batches:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    accumulated_count = 0
             
             avg_losses = np.mean(epoch_losses, axis=0)
             total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_losses
