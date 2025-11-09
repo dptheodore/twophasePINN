@@ -2,7 +2,7 @@ from scipy.ndimage import sobel
 from marching_squares import Grid, march
 import numpy as np
 from scipy.interpolate import interpn
-
+from sklearn.metrics import mean_squared_error
 
 def process_line(X, Y, grid_scale, levelset_t, intersections, orientation, fixed_coord, lo_bound, hi_bound):
     ISO_VALUE = 0.5
@@ -220,7 +220,7 @@ def compute_grad_normals_region_bounded(levelset_t, X, Y, grid_scale, region_bou
     intersection_length_top = top_len
     intersection_length_left = left_len
     intersection_length_right = right_len
-
+    print(f"{mean_squared_error(grad_vec, integrated_normal):2e}")
     return (grad_vec, integrated_normal,
             edges, edges_info_for_plot,
             intersection_span_bottom, intersection_length_bottom, \

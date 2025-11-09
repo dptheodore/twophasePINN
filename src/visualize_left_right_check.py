@@ -8,6 +8,7 @@ from scipy.ndimage import sobel
 from skimage.metrics import mean_squared_error
 from tqdm import tqdm
 from marching_squares import Grid, march
+import matplotlib.animation as animation
 
 def clip_segment(p1, p2, x_min, x_max, y_min, y_max):
     x1, y1 = p1; x2, y2 = p2; dx, dy = x2 - x1, y2 - y1
@@ -190,14 +191,14 @@ def plot_frame(ax, X, Y, levelset_t, edges, edges_info, region_bounds,
     ax.add_patch(rect)
     
     x_start, x_end = intersection_span_bottom
-    if x_start is not None and x_end is not None:
-        ax.plot([x_start, x_end], [y_bottom, y_bottom],
-                color='purple', linewidth=1, zorder=7, solid_capstyle='butt')
+    #if x_start is not None and x_end is not None:
+        #ax.plot([x_start, x_end], [y_bottom, y_bottom],
+                #color='purple', linewidth=1, zorder=7, solid_capstyle='butt')
     
     y_start, y_end = intersection_span_left
-    if y_start is not None and y_end is not None:
-        ax.plot([x_min, x_min], [y_start, y_end],
-                color='purple', linewidth=1, zorder=7, solid_capstyle='butt')
+    #if y_start is not None and y_end is not None:
+        #ax.plot([x_min, x_min], [y_start, y_end],
+                #color='purple', linewidth=1, zorder=7, solid_capstyle='butt')
 
     ax.arrow(track_point[0], track_point[1], grad_vec[0], grad_vec[1], width=0.005, head_width=0.02, fc='deeppink', ec='deeppink', zorder=6)
     ax.arrow(track_point[0], track_point[1], integrated_normal[0], integrated_normal[1], width=0.005, head_width=0.02, fc='blue', ec='blue', zorder=5, alpha=0.7)
@@ -262,11 +263,11 @@ def create_animation(h5_path, num_frames, time_range, region_bounds):
     os.makedirs(frame_dir, exist_ok=True)
     grid_scale = X[1] - X[0]
         # Create a multi-panel figure
-    fig, axes = plt.subplots(2, 2, figsize=(15, 14))
-    ax_main = axes[0, 0]
-    ax_timeseries = axes[0, 1]
-    ax_error = axes[1, 0]
-    axes[1, 1].axis('off') # Hide the unused subplot
+    fig, axes = plt.subplots(1, 1, figsize=(15, 14))
+    ax_main = axes
+    # ax_timeseries = axes[0, 1]
+    # ax_error = axes[1, 0]
+    # axes[1, 1].axis('off') # Hide the unused subplot
 
     # Lists to store data for time-series plots
     time_history, area_history, flux_history, error_history = [], [], [], []
@@ -293,14 +294,16 @@ def create_animation(h5_path, num_frames, time_range, region_bounds):
 
         plot_frame(ax_main, X, Y, levelset_t, edges, edges_info,
                     region_bounds, grad_vec, integrated_normal, track_point, time_t,
-                   intersection_span_bottom, intersection_length_bottom, intersection_span_left, intersection_length_left, arrow_skip_rate=1)
+                   intersection_span_bottom, intersection_length_bottom, intersection_span_left, intersection_length_left, arrow_skip_rate=3)
 
-        plot_timeseries(ax_timeseries, time_history, area_history, flux_history, time_t)
-        plot_error(ax_error, time_history, error_history, time_t)
+        #plot_timeseries(ax_timeseries, time_history, area_history, flux_history, time_t)
+        #plot_error(ax_error, time_history, error_history, time_t)
         
         filename = f"{frame_dir}/frame_{i:04d}.png"
         filenames.append(filename)
-        plt.savefig(filename, dpi=150)
+        plt.savefig(filename, dpi=600)
+        ani = animation.FuncAnimation(fig, animate, init_func=init,
+                               frames=200, interval=20, blit=True)
 
     plt.close(fig)
     print("All frames generated.")
@@ -318,7 +321,7 @@ if __name__ == '__main__':
     
     create_animation(
         h5_path=HDF5_DATA_PATH,
-        num_frames=100,
+        num_frames=50,
         time_range=(0.0, 3.0),
         region_bounds=COMPUTATION_REGION
     )

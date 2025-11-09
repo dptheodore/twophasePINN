@@ -81,8 +81,7 @@ def create_animation(h5_path, num_frames, time_range, num_patches=(8, 8)):
     for p in patches_list_a['results']:
         testSet.add(p['time_value'])
     timeList = sorted(list(testSet))
-    indicesUsed = [i for (i, time) in enumerate(times) for timeSnapshot in timeList if np.isclose(time, timeSnapshot)]
-
+    indicesUsed = [i for (i, time) in enumerate(times) for timeSnapshot in timeList if np.isclose(time, timeSnapshot/4)]
 
     for i, time_idx in enumerate(tqdm(indicesUsed, desc="Processing Frames")):
         time_t = times[time_idx]
