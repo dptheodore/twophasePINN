@@ -350,7 +350,7 @@ def main():
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
     checkpoint_interval = 50
-    num_of_batches = 20
+    num_of_batches = 15
     
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches) 

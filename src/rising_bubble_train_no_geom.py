@@ -758,16 +758,6 @@ def main():
     plt.yscale('log')
     plt.grid(True, which="both", ls="--")
     plt.savefig(os.path.join(dirname, 'loss_history_conservation_ma.png'))
-
-    # Plot 4: MSE GEOM
-    plt.figure(figsize=(10, 6))
-    plt.plot(epochs_range, history_loss_geom)
-    plt.title(f'MSE of Geometric Loss Grad vs Int. Norm. vs. Epochs ({adaptive_mode} - {activation_choice})')
-    plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss Geom')
-    plt.yscale('log')
-    plt.grid(True, which="both", ls="--")
-    plt.savefig(os.path.join(dirname, 'loss_history_geom.png'))
     
     plt.close('all') # Close all figures to free memory
     logger.info("Plots saved successfully.")
@@ -780,8 +770,7 @@ def main():
         'epoch': epochs_range,
         'MSE_alpha': history_loss_a,
         'MSE_f_uv': history_loss_f_uv,
-        'MSE_f_ma': history_loss_f_ma,
-        'MSE_geom': history_loss_geom
+        'MSE_f_ma': history_loss_f_ma
     })
     
     history_df.to_csv(history_filepath, index=False)
