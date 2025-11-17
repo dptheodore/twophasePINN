@@ -222,6 +222,7 @@ def get_training_data(NOP_A, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west):
     interface, normal, tangent = compute_normals(X, Y, levelset, cell_size)
     print("Generating points for A")
     data_A = get_points_a(NOP_A, times, X, Y, cell_size, interface, normal, tangent, levelset)
+    data_A[:, 3] = (data_A[:, 3] * 2.0) - 1.0
     print("Generating points for PDE")
     data_PDE = get_points_pde(NOP_PDE, times, X, Y, cell_size, interface, normal, tangent, levelset)
     print("Generating points for NSEW")

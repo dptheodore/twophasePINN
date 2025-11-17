@@ -253,76 +253,8 @@ class TwoPhasePinn(tf.keras.Model):
         plt.quiver(xg, yg, grad_x_pred, grad_y_pred, angles="xy", scale_units="xy", scale=1)
         plt.title("Predicted Grad Vecs")
 
-        plt.gca().invert_yaxis()  # optional if your Y goes downward
+        #plt.gca().invert_yaxis()  # optional if your Y goes downward
         plt.show()
-
-
-
-    # def debug_geom_visual(xg, yg, grad_vec_pred, grad_vec_gt, stride=4, title="Geom Debug"):
-    #     """
-    #     Visualize predicted vs ground-truth gradient fields.
-    #     Can be called from within your geom loss computation for debugging.
-
-    #     Args:
-    #         xg, yg: 1D or 2D arrays of coordinates (used for plotting).
-    #         grad_vec_pred: [H, W, 2] predicted gradients (Tensor or np array).
-    #         grad_vec_gt:   [H, W, 2] ground-truth gradients (Tensor or np array).
-    #         stride: int, subsampling step for quiver plot.
-    #         title: figure title.
-    #     """
-    #     # --- Convert tensors to numpy ---
-    #     if hasattr(grad_vec_pred, "numpy"):
-    #         grad_vec_pred = grad_vec_pred.numpy()
-    #     if hasattr(grad_vec_gt, "numpy"):
-    #         grad_vec_gt = grad_vec_gt.numpy()
-
-    #     # --- Compute magnitudes and normalized directions ---
-    #     grad_mag_pred = np.linalg.norm(grad_vec_pred, axis=-1)
-    #     grad_mag_gt = np.linalg.norm(grad_vec_gt, axis=-1)
-    #     eps = 1e-8
-    #     grad_dir_pred = grad_vec_pred / (grad_mag_pred[..., None] + eps)
-    #     grad_dir_gt = grad_vec_gt / (grad_mag_gt[..., None] + eps)
-
-    #     # --- Build coordinate grid for quiver ---
-    #     if xg.ndim == 1 and yg.ndim == 1:
-    #         X, Y = np.meshgrid(xg, yg)
-    #     else:
-    #         X, Y = xg, yg
-
-    #     # --- Make figure ---
-    #     fig, axs = plt.subplots(2, 3, figsize=(12, 8))
-    #     fig.suptitle(title, fontsize=14)
-
-    #     # Magnitude maps
-    #     axs[0,0].imshow(grad_mag_gt, cmap='viridis')
-    #     axs[0,0].set_title("GT |∇φ|")
-
-    #     axs[0,1].imshow(grad_mag_pred, cmap='viridis')
-    #     axs[0,1].set_title("Pred |∇φ|")
-
-    #     axs[0,2].imshow(np.abs(grad_mag_pred - grad_mag_gt), cmap='inferno')
-    #     axs[0,2].set_title("Abs diff |∇φ|")
-
-    #     # Direction fields
-    #     axs[1,0].quiver(X[::stride,::stride], Y[::stride,::stride],
-    #                     grad_dir_gt[::stride,::stride,0],
-    #                     -grad_dir_gt[::stride,::stride,1], color='cyan', scale=30)
-    #     axs[1,0].set_title("GT ∇φ direction")
-
-    #     axs[1,1].quiver(X[::stride,::stride], Y[::stride,::stride],
-    #                     grad_dir_pred[::stride,::stride,0],
-    #                     -grad_dir_pred[::stride,::stride,1], color='orange', scale=30)
-    #     axs[1,1].set_title("Pred ∇φ direction")
-
-    #     dir_diff = np.sum((grad_dir_pred - grad_dir_gt)**2, axis=-1)
-    #     axs[1,2].imshow(dir_diff, cmap='magma')
-    #     axs[1,2].set_title("Direction mismatch")
-
-    #     for ax in axs.flat:
-    #         ax.axis("off")
-
-    #     plt.tight_layout()
-    #     plt.show()
 
 
     def compute_geom_loss(self, data_GEOM, geom_weight=1e1, delta=0.5 * 0.00390625,
@@ -749,7 +681,7 @@ def main():
                 data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
                 data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
                 data_GEOM = to_tensor_tuple(batch_dict['GEOM'], batch_dict['GEOM'].columns)
-                pinn.debug_geom_visual(data_GEOM)
+                #pinn.debug_geom_visual(data_GEOM)
                 batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
                 epoch_losses.append([l.numpy() for l in batch_loss_values])
 
