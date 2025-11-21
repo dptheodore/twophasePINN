@@ -55,7 +55,6 @@ class TwoPhasePinn(tf.keras.Model):
 
         # Loss weights
         self.loss_weights_PDE = tf.constant(loss_weights_PDE, dtype=tf.float32)
-
         # Adaptive activation coefficients
         self.use_ad_act = use_ad_act
         self.ad_act_coeff = {}
@@ -349,8 +348,8 @@ def main():
     loss_weights_PDE = [1.0, 10.0, 10.0, 1.0]
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
-    checkpoint_interval = 50
-    num_of_batches = 15
+    checkpoint_interval = 10
+    num_of_batches = 20
     
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches) 
@@ -370,7 +369,7 @@ def main():
     def to_tensor_tuple(df, columns):
         return tuple(tf.constant(df[c].to_numpy().reshape(-1, 1), dtype=tf.float32) for c in columns)
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rates[0])
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rates[0], epsilon=1e-8)
     current_best_total_loss = float('inf')
     for i, (epochs, lr) in enumerate(zip(epochs_list, learning_rates)):
         logger.info(f"\n--- Starting Training Phase {i+1}/{len(epochs_list)} ---")
@@ -380,7 +379,14 @@ def main():
         start_checkpoint_time = time.time()
         for epoch in range(1, epochs + 1):
             epoch_losses = []
-            shuffled_data = {key: df.sample(frac=1) for key, df in training_data.items()}
+            shuffled_data = {}
+            for key, df in training_data.items():
+                length = len(df)
+                shuffled_indices = np.random.choice(length, length, replace=False)
+                shuffled_data[key] = pd.DataFrame(
+                    data=df.to_numpy()[shuffled_indices, :], 
+                    columns=df.columns
+                )
 
             for b in range(num_batches):
                 batch_dict = {}
@@ -401,8 +407,8 @@ def main():
                 batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW)
                 epoch_losses.append([l.numpy() for l in batch_loss_values])
 
-            avg_losses = np.mean(epoch_losses, axis=0)
-            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_losses
+            sum_losses = np.sum(epoch_losses, axis=0)
+            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = sum_losses
 
             history_loss_a.append(loss_a)
             history_loss_f_uv.append(loss_u + loss_v)
@@ -468,8 +474,8 @@ def main():
         final_evaluation_losses.append([l.numpy() for l in batch_losses])
 
     # Calculate the mean loss across all batches
-    avg_final_losses = np.mean(final_evaluation_losses, axis=0)
-    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_final_losses
+    sum_final_losses = np.sum(final_evaluation_losses, axis=0)
+    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = sum_final_losses
 
     logger.info("--- Final Loss Breakdown ---")
     logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")
