@@ -105,8 +105,6 @@ class TwoPhasePinn(tf.keras.Model):
         yg_np = yg.numpy().squeeze()
         grad_x_gt_np = grad_x_gt.numpy().squeeze()
         grad_y_gt_np = grad_y_gt.numpy().squeeze()
-        normal_x_gt_np = normal_x_gt.numpy().squeeze()
-        normal_y_gt_np = normal_y_gt.numpy().squeeze()
         
         # 2. Calculate Predicted Gradients (VOF method)
         # 'delta' is h/2
@@ -127,22 +125,12 @@ class TwoPhasePinn(tf.keras.Model):
         # Calculate predicted VOF gradient
         grad_x_pred_np = a_left_np - a_right_np
         grad_y_pred_np = a_bottom_np - a_top_np
-
-        # 3. Calculate Predicted Normals
-        norm_mag_pred = np.sqrt(grad_x_pred_np**2 + grad_y_pred_np**2 + 1e-8)
-        normal_x_pred_np = grad_x_pred_np / norm_mag_pred
-        normal_y_pred_np = grad_y_pred_np / norm_mag_pred
         
         # 4. Calculate Errors and Magnitudes
         grad_mag_gt = np.sqrt(grad_x_gt_np**2 + grad_y_gt_np**2)
         grad_mag_pred = np.sqrt(grad_x_pred_np**2 + grad_y_pred_np**2)
-        norm_mag_gt = np.sqrt(normal_x_gt_np**2 + normal_y_gt_np**2)
-        norm_mag_pred_calc = np.sqrt(normal_x_pred_np**2 + normal_y_pred_np**2) 
         
         grad_error_mag = np.sqrt((grad_x_pred_np - grad_x_gt_np)**2 + (grad_y_pred_np - grad_y_gt_np)**2)
-        
-        dot_product = np.clip((normal_x_pred_np * normal_x_gt_np) + (normal_y_pred_np * normal_y_gt_np), -1.0, 1.0)
-        normal_error_mag = 1.0 - dot_product # Cosine distance
 
         # 5. Create Plots (2x3 grid)
         plt.figure(figsize=(20, 12))
@@ -163,23 +151,6 @@ class TwoPhasePinn(tf.keras.Model):
         sc1 = plt.scatter(xg_np, yg_np, c=grad_error_mag, cmap='viridis', s=10)
         plt.colorbar(sc1, label='VOF Grad L2 Error')
         plt.title("VOF Gradient Error Heatmap")
-        plt.gca().set_aspect('equal', adjustable='box')
-
-        # --- Row 2: Normals (Normalized VOF Grad vs. "True" Normal) ---
-        plt.subplot(2, 3, 4)
-        plt.quiver(xg_np, yg_np, normal_x_gt_np, normal_y_gt_np, angles="xy", scale_units="xy", scale=1, color='blue')
-        plt.title(f"GT 'True' Normal (Avg Mag: {np.mean(norm_mag_gt):.2e})")
-        plt.gca().set_aspect('equal', adjustable='box')
-
-        plt.subplot(2, 3, 5)
-        plt.quiver(xg_np, yg_np, normal_x_pred_np, normal_y_pred_np, angles="xy", scale_units="xy", scale=1, color='red')
-        plt.title(f"Pred Normal (from VOF Grad) (Avg Mag: {np.mean(norm_mag_pred_calc):.2e})")
-        plt.gca().set_aspect('equal', adjustable='box')
-        
-        plt.subplot(2, 3, 6)
-        sc2 = plt.scatter(xg_np, yg_np, c=normal_error_mag, cmap='viridis', s=10)
-        plt.colorbar(sc2, label='Normal Angular Error (1 - cos)')
-        plt.title("Normal Error Heatmap")
         plt.gca().set_aspect('equal', adjustable='box')
 
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
@@ -250,8 +221,8 @@ class TwoPhasePinn(tf.keras.Model):
         grad_vec_pred = tf.concat([grad_x_pred, grad_y_pred], axis=1)
 
         # ---- 3) Calculate predicted normal vector ----
-        norm_mag_pred = tf.sqrt(tf.square(grad_x_pred) + tf.square(grad_y_pred)) + 1e-8
-        normal_pred_unit = grad_vec_pred / tf.expand_dims(norm_mag_pred, -1)
+        # norm_mag_pred = tf.sqrt(tf.square(grad_x_pred) + tf.square(grad_y_pred)) + 1e-8
+        # normal_pred_unit = grad_vec_pred / tf.expand_dims(norm_mag_pred, -1)
 
         # ---- 4) Soft-contour weighting (CENTERED AT 0.5) ----
         # Weight is high when a_center is near 0.5 (the interface)
@@ -267,9 +238,9 @@ class TwoPhasePinn(tf.keras.Model):
         grad_y_gt_s = tf.squeeze(grad_y_gt, -1)
         grad_vec_gt = tf.stack([grad_x_gt_s, grad_y_gt_s], axis=1)
         
-        normal_x_gt_s = tf.squeeze(normal_x_gt, -1)
-        normal_y_gt_s = tf.squeeze(normal_y_gt, -1)
-        normal_vec_gt = tf.stack([normal_x_gt_s, normal_y_gt_s], axis=1)
+        # normal_x_gt_s = tf.squeeze(normal_x_gt, -1)
+        # normal_y_gt_s = tf.squeeze(normal_y_gt, -1)
+        # normal_vec_gt = tf.stack([normal_x_gt_s, normal_y_gt_s], axis=1)
         
         # ---- 6) Huber loss on grad magnitudes (VOF vector) ----
         diff_grad = grad_vec_pred - grad_vec_gt
@@ -281,14 +252,14 @@ class TwoPhasePinn(tf.keras.Model):
 
         # ---- 7) Normal (direction) loss: use cosine distance ----
         # We compare our predicted normal to the "true" (Marching Squares) normal
-        cos_sim = tf.reduce_sum(normal_pred_unit * normal_vec_gt, axis=1, keepdims=True)
-        cos_sim = tf.clip_by_value(cos_sim, -1.0, 1.0)
+        # cos_sim = tf.reduce_sum(normal_pred_unit * normal_vec_gt, axis=1, keepdims=True)
+        # cos_sim = tf.clip_by_value(cos_sim, -1.0, 1.0)
         
-        loss_normal_point = 1.0 - cos_sim
-        loss_normal = tf.reduce_mean(w2 * loss_normal_point)
+        # loss_normal_point = 1.0 - cos_sim
+        # loss_normal = tf.reduce_mean(w2 * loss_normal_point)
 
         # ---- 8) Combine losses ----
-        loss_geom = geom_weight * (loss_grad_vec + loss_normal)
+        loss_geom = geom_weight * (loss_grad_vec)
 
         if debug:
             self.run_geom_diagnostics(
@@ -297,7 +268,6 @@ class TwoPhasePinn(tf.keras.Model):
                 tf.reshape(grad_x_pred, [-1]),
                 tf.reshape(grad_y_pred, [-1]),
                 grad_x_gt, grad_y_gt,
-                normal_x_gt, normal_y_gt,
                 loss_geom, loss_PDE, loss_BC
             )
 
@@ -436,7 +406,7 @@ class TwoPhasePinn(tf.keras.Model):
 
         loss_PDE = tf.tensordot(tf.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_a]), self.loss_weights_PDE, 1)
 
-        loss_geom = self.compute_geom_loss(data_GEOM, 1, delta=0.00390625 , debug=False)
+        loss_geom = self.compute_geom_loss(data_GEOM, 1e2, delta=0.00390625 , debug=False)
 
         # === Combine all losses ===
         total_loss = loss_a_A + loss_BC + loss_PDE + loss_geom
@@ -586,7 +556,7 @@ def main():
     loss_weights_PDE = [1.0, 10.0, 10.0, 1.0]
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
-    checkpoint_interval = 1
+    checkpoint_interval = 10
     num_of_batches = 20
     
     num_samples_total = sum(len(df) for df in training_data.values())
@@ -636,7 +606,7 @@ def main():
                 data_EW = to_tensor_tuple(batch_dict['EW'], ['x_E', 'y_E', 't_EW', 'x_W', 'y_W'])
                 data_NSEW = to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns)
                 data_GEOM = to_tensor_tuple(batch_dict['GEOM'], batch_dict['GEOM'].columns)
-                pinn.debug_geom_visual(data_GEOM)
+                #pinn.debug_geom_visual(data_GEOM)
                 batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW, data_GEOM)
                 epoch_losses.append([l.numpy() for l in batch_loss_values])
 
