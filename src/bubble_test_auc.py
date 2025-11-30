@@ -9,14 +9,11 @@ import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+import csv  # <--- Added import
 
 def update_contourf_fixed(frame, x_list, y_list, data_list, ax_list, pcfsets, kwargs):
     """
     Updates the contour plots for each frame.
-    Handles:
-      1. Matplotlib 3.8+ cleanup (removing old contours).
-      2. List-wrapped ContourSets.
-      3. List-wrapped kwargs (The specific fix for your new error).
     """
     artists = []
     
@@ -24,7 +21,6 @@ def update_contourf_fixed(frame, x_list, y_list, data_list, ax_list, pcfsets, kw
         # --- 1. CLEANUP PREVIOUS FRAME ---
         current_plot = pcfsets[i]
         
-        # Unwrap list if necessary (e.g., if grid_contour_plots returns lists of artists)
         if isinstance(current_plot, (list, tuple)):
             current_plot = current_plot[0] if len(current_plot) > 0 else None
 
@@ -42,8 +38,6 @@ def update_contourf_fixed(frame, x_list, y_list, data_list, ax_list, pcfsets, kw
 
         # --- 3. FIX KWARGS (Handle List vs Dict) ---
         if isinstance(kwargs, (list, tuple)):
-            # If kwargs is a list, try to grab the one for this specific plot index.
-            # If the list is shorter (e.g. length 1), reuse the first element.
             if i < len(kwargs):
                 plot_kwargs = kwargs[i]
             elif len(kwargs) > 0:
@@ -51,14 +45,11 @@ def update_contourf_fixed(frame, x_list, y_list, data_list, ax_list, pcfsets, kw
             else:
                 plot_kwargs = {}
         else:
-            # It is already a dictionary
             plot_kwargs = kwargs
 
         # --- 4. PLOT NEW FRAME ---
-        # Now we pass a dictionary (plot_kwargs) instead of a list
         new_contour = ax.contourf(x, y, current_data, **plot_kwargs)
         
-        # Update reference so we can remove it next frame
         pcfsets[i] = new_contour
         artists.append(new_contour)
 
@@ -68,10 +59,9 @@ def compute_mae_over_time(cfd_data, nn_data):
     """
     Compute MAE at each time point. 
     Assumes cfd_data, nn_data: shape [nt, nx, ny]
-    and t has shape [nt]
     """
     nt, nx, ny = cfd_data.shape
-    print(f'CFD SHAPE: {cfd_data.shape}')
+    # print(f'CFD SHAPE: {cfd_data.shape}') # Commented out to reduce noise during CSV generation
     mae = np.zeros(nt)
     l1_norm = np.zeros(nt)
     l2_norm = np.zeros(nt)
@@ -84,17 +74,46 @@ def compute_mae_over_time(cfd_data, nn_data):
         l1_true_norm[i] = np.linalg.norm(cfd_data[i, :, :], ord=1)
         l2_norm[i] = np.linalg.norm(error_vector, ord=2)
         l2_true_norm[i] = np.linalg.norm(cfd_data[i, :, :], ord=2)
-        # Avoid division by zero if true norm is 0
+        
         if l1_true_norm[i] != 0:
             l1_norm[i] = l1_norm[i] / l1_true_norm[i]
         if l2_true_norm[i] != 0:
             l2_norm[i] = l2_norm[i] / l2_true_norm[i]
     return mae, l1_norm, l2_norm
 
+def save_error_auc_to_csv(t, cfd_data_list, nn_data_list, var_names, filename="error_auc.csv"):
+    """
+    Calculates the Area Under the Curve (AUC) for MAE, L1, and L2 errors using the 
+    Trapezoidal rule and saves the results to a CSV file.
+    """
+    print(f"\nCalculating AUC for errors and saving to '{filename}'...")
+    
+    with open(filename, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        # Write Header
+        writer.writerow(["Variable", "Error_Type", "AUC_Value"])
+
+        for cfd, nn, name in zip(cfd_data_list, nn_data_list, var_names):
+            # 1. Compute the error vectors over time
+            mae, l1_norm, l2_norm = compute_mae_over_time(cfd, nn)
+
+            # 2. Integrate using Trapezoidal rule (np.trapz)
+            auc_mae = np.trapz(mae, x=t)
+            auc_l1 = np.trapz(l1_norm, x=t)
+            auc_l2 = np.trapz(l2_norm, x=t)
+
+            # 3. Write rows to CSV
+            writer.writerow([name, "MAE", auc_mae])
+            writer.writerow([name, "L1_Norm", auc_l1])
+            writer.writerow([name, "L2_Norm", auc_l2])
+
+            print(f"  Processed {name}: MAE AUC={auc_mae:.4f}")
+
+    print("CSV save complete.")
+
 def plot_mae_and_norms_scaled(t, cfd_data, nn_data, var_names):
     """
     Plot MAE (red, left y-axis) and Norms (blue, right y-axis) over time.
-    Assumes cfd_data, nn_data: list of arrays with shape [nt, ny, nx]
     """
     n_vars = len(var_names)
     fig, axes = plt.subplots(n_vars, 1, figsize=(8, 4*n_vars), sharex=True)
@@ -109,10 +128,9 @@ def plot_mae_and_norms_scaled(t, cfd_data, nn_data, var_names):
         ax.set_ylabel(f'{name} MAE', color='red')
         ax.tick_params(axis='y', labelcolor='red')
 
-        # Right axis (blue) for L1 and L2 norms
         ax2 = ax.twinx()
-        ax2.plot(t, l1_norm, 'b-', label=f'{name} L1 Norm')    # Solid blue line
-        ax2.plot(t, l2_norm, 'b--', label=f'{name} L2 Norm')   # Dotted blue line
+        ax2.plot(t, l1_norm, 'b-', label=f'{name} L1 Norm')
+        ax2.plot(t, l2_norm, 'b--', label=f'{name} L2 Norm')
         ax2.set_ylabel(f'{name} Norms', color='blue')
         ax2.tick_params(axis='y', labelcolor='blue')
 
@@ -144,14 +162,14 @@ def main():
 
     # BUILD THE MODEL ARCHITECTURE
     inputs = tf.keras.Input(shape=(3,), name="input_tensor")
-    z = tf.keras.layers.Dense(320, activation='tanh')(inputs)
-    z = tf.keras.layers.Dense(320, activation='tanh')(z)
-    z = tf.keras.layers.Dense(320, activation='tanh')(z)
-    z = tf.keras.layers.Dense(320, activation='tanh')(z)
-    z = tf.keras.layers.Dense(320, activation='tanh')(z)
-    z = tf.keras.layers.Dense(320, activation='tanh')(z)
-    z = tf.keras.layers.Dense(320, activation='tanh')(z)
-    z = tf.keras.layers.Dense(320, activation='tanh')(z)
+    z = tf.keras.layers.Dense(400, activation='tanh')(inputs)
+    z = tf.keras.layers.Dense(400, activation='tanh')(z)
+    z = tf.keras.layers.Dense(400, activation='tanh')(z)
+    z = tf.keras.layers.Dense(400, activation='tanh')(z)
+    z = tf.keras.layers.Dense(400, activation='tanh')(z)
+    z = tf.keras.layers.Dense(400, activation='tanh')(z)
+    z = tf.keras.layers.Dense(400, activation='tanh')(z)
+    z = tf.keras.layers.Dense(400, activation='tanh')(z)
 
     output_u = tf.keras.layers.Dense(1, activation='linear', name="output_u")(z)
     output_v = tf.keras.layers.Dense(1, activation='linear', name="output_v")(z)
@@ -161,10 +179,9 @@ def main():
     model = tf.keras.Model(inputs=inputs, outputs=[output_u, output_v, output_p, output_a])
 
     # LOAD TRAINED WEIGHTS
-    weights_path = "./regular/regular.weights.h5"
+    weights_path = "./hyperparam/hyperparam.weights.h5"
     if not os.path.exists(weights_path):
         print(f"Warning: Weights file {weights_path} not found.")
-        # Create dummy weights if testing without file, or handle error
     else:
         model.load_weights(weights_path)
 
@@ -200,18 +217,21 @@ def main():
         interval=50, blit=False, repeat=False
     )
 
-    # Save to file instead of showing
     try:
         ani.save("bubble_comparison.gif", writer='pillow', fps=10)
         print("Success: Saved 'bubble_comparison.gif'")
     except Exception as e:
         print(f"Failed to save GIF: {e}")
 
-    # Plot MAE graphs (this will pop up a static window after the animation saves)
+    # DEFINE LISTS FOR ERROR CALCULATION
     cfd_list = [pressure_cfd, velocityY_cfd, velocityX_cfd ]
     nn_list  = [pressure_nn, velocityY_nn, velocityX_nn ]
     var_names = ['p (pressure)', 'u (velocityX)', 'v (velocityY)' ]
     
+    # 1. SAVE AUC TO CSV (New Step)
+    save_error_auc_to_csv(t, cfd_list, nn_list, var_names, filename="error_auc.csv")
+
+    # 2. PLOT MAE GRAPHS
     plot_mae_and_norms_scaled(t, cfd_list, nn_list, var_names)
 
 if __name__ == "__main__":

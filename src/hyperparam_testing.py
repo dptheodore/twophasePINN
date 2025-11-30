@@ -13,8 +13,10 @@ from optuna.pruners import MedianPruner
 import math
 import time
 from datetime import datetime
+
+# Import utilities
 from generate_points import get_training_data
-from utilities import NNCreator
+from utilities import NNCreator, load_cfd
 import tensorflow.keras.backend as K
 from tensorflow.keras.utils import get_custom_objects
 
@@ -26,6 +28,61 @@ get_custom_objects().update({'sine': sine_activation})
 # Set seeds
 np.random.seed(1234)
 tf.random.set_seed(1234)
+
+# --- GLOBAL VALIDATION DATA CACHE ---
+# load the CFD data once to avoid high I/O overhead during optimization trials.
+VALIDATION_DATA = {
+    "inputs": None,
+    "targets_u": None,
+    "targets_v": None,
+    "targets_p": None
+}
+
+def load_validation_data_once():
+    """
+    Loads and prepares the CFD data for validation, matching the logic
+    in rising_bubble_test.py.
+    """
+    if VALIDATION_DATA["inputs"] is not None:
+        return
+
+    print("Loading CFD Validation Data...")
+    
+    # 1. Load CFD Solution (Start 0, End 151, steps matching test file)
+    pressure_cfd, velocityX_cfd, velocityY_cfd, levelset_cfd, x, y, t = load_cfd(
+        start_index=0, end_index=151,
+        temporal_step_size=10, spatial_step_size=2
+    )
+
+    # 2. Reference Parameters
+    L_ref = 0.25
+    rho_ref = 1000
+
+    # 3. Non-dimensionalization
+    x = x / L_ref 
+    y = y / L_ref 
+    t = t / L_ref 
+    pressure_cfd = pressure_cfd / rho_ref
+
+    X, Y, T = np.meshgrid(x, y, t, indexing='xy')
+    
+    x_flat = X.flatten()
+    y_flat = Y.flatten()
+    t_flat = T.flatten()
+    
+    # Create input tensor (N, 3)
+    inputs = np.stack([x_flat, y_flat, t_flat], axis=1)
+    
+    u_flat = velocityX_cfd.flatten()
+    v_flat = velocityY_cfd.flatten()
+    p_flat = pressure_cfd.flatten()
+
+    VALIDATION_DATA["inputs"] = inputs
+    VALIDATION_DATA["targets_u"] = u_flat
+    VALIDATION_DATA["targets_v"] = v_flat
+    VALIDATION_DATA["targets_p"] = p_flat
+    
+    print(f"Validation Data Loaded. {inputs.shape[0]} points.")
 
 class TwoPhasePinn(tf.keras.Model):
     def __init__(self, hidden_layers, activation_functions, loss_weights_PDE, 
@@ -173,30 +230,74 @@ class TwoPhasePinn(tf.keras.Model):
         
         return total_loss
 
+def validate_model(model, batch_size=500000):
+    """
+    Computes the MAE against the CFD ground truth using the cached validation data.
+    """
+    inputs = VALIDATION_DATA["inputs"]
+    target_u = VALIDATION_DATA["targets_u"]
+    target_v = VALIDATION_DATA["targets_v"]
+    target_p = VALIDATION_DATA["targets_p"]
+    
+    num_samples = inputs.shape[0]
+    num_batches = int(np.ceil(num_samples / batch_size))
+    
+    pred_u_list = []
+    pred_v_list = []
+    pred_p_list = []
+    
+    # Predict in batches to avoid OOM
+    for i in range(num_batches):
+        batch_slice = slice(i*batch_size, (i+1)*batch_size)
+        preds = model.predict(inputs[batch_slice], verbose=0)
+        # preds is list: [u, v, p, a]
+        pred_u_list.append(preds[0])
+        pred_v_list.append(preds[1])
+        pred_p_list.append(preds[2])
+        
+    # Concatenate results
+    pred_u = np.concatenate(pred_u_list, axis=0).flatten()
+    pred_v = np.concatenate(pred_v_list, axis=0).flatten()
+    pred_p = np.concatenate(pred_p_list, axis=0).flatten()
+    
+    # Calculate MAE
+    mae_u = np.mean(np.abs(pred_u - target_u))
+    mae_v = np.mean(np.abs(pred_v - target_v))
+    mae_p = np.mean(np.abs(pred_p - target_p))
+    
+    total_mae = mae_u + mae_v + mae_p
+    
+    return total_mae, mae_u, mae_v, mae_p
+
 
 def objective(trial):
-    """Optuna objective function with early stopping."""
+    """Optuna objective function."""
+    
+    # Ensure fresh session
+    tf.keras.backend.clear_session()
     
     try:
-        # Sample hyperparameters
+        # Hyperparameters
         n_layers = trial.suggest_int('n_layers', 6, 10)
         n_neurons = trial.suggest_int('n_neurons', 256, 512, step=32)
         
-        # Loss weights (logarithmic scale)
-        weight_m = trial.suggest_float('weight_m', 0.1, 10.0, log=True)
-        weight_u = trial.suggest_float('weight_u', 0.1, 10.0, log=True)
-        weight_v = trial.suggest_float('weight_v', 0.1, 10.0, log=True)
-        weight_a = trial.suggest_float('weight_a', 0.1, 10.0, log=True)
+        weight_options = [0.1, 1.0, 10.0]
+        weight_m = trial.suggest_categorical('weight_m', weight_options)
+        weight_u = trial.suggest_categorical('weight_u', weight_options)
+        weight_v = trial.suggest_categorical('weight_v', weight_options)
+        weight_a = trial.suggest_categorical('weight_a', weight_options)
         
         loss_weights_PDE = [weight_m, weight_u, weight_v, weight_a]
         hidden_layers = [n_neurons] * n_layers
         
         print(f"\nTrial {trial.number}: layers={n_layers}, neurons={n_neurons}")
-        print(f"  Loss weights: m={weight_m:.3f}, u={weight_u:.3f}, v={weight_v:.3f}, a={weight_a:.3f}")
-    except:
-        pass
+        print(f"  Weights: m={weight_m}, u={weight_u}, v={weight_v}, a={weight_a}")
+        
+    except Exception as e:
+        print(f"Trial Pruned due to parameter error: {e}")
+        raise optuna.TrialPruned()
     
-    # Load training data
+    # Load Training Data
     NOP_a = (500, 400)
     NOP_PDE = (400, 2000, 3000)
     NOP_north = (20, 20)
@@ -206,7 +307,7 @@ def objective(trial):
     
     training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
     
-    # Setup model
+    # Setup Model
     mu = [1.0, 10.0]
     sigma = 24.5
     g = -0.98
@@ -215,16 +316,14 @@ def objective(trial):
     L_ref = 0.25
     
     pinn = TwoPhasePinn(hidden_layers, {}, loss_weights_PDE, mu, sigma, g, rho, u_ref, L_ref)
-    #pinn.nn.load_weights('initial_weights.h5')
     
     optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
     
-    # Training setup
+    # Training Config
     num_of_batches = 15
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches)
     
-    # Calculate batch sizes
     batch_sizes = {}
     for key, df in training_data.items():
         if len(df) > 0:
@@ -232,19 +331,14 @@ def objective(trial):
             batch_sizes[key] = math.ceil(proportion * total_batch_size)
         else:
             batch_sizes[key] = 0
-    
+            
     def to_tensor_tuple(df, columns):
         return tuple(tf.constant(df[c].to_numpy().reshape(-1, 1), dtype=tf.float32) for c in columns)
     
-    # Early stopping parameters
-    max_epochs = 2500
-    patience = 100
-    best_loss = float('inf')
-    patience_counter = 0
-    print_checkpoint = 10
-    start_time = time.time()
+    # Training Loop
+    max_epochs = 2000 
+    print_checkpoint = 50
     
-    # Training loop
     for epoch in range(1, max_epochs + 1):
         epoch_losses = []
         shuffled_data = {key: df.sample(frac=1) for key, df in training_data.items()}
@@ -258,7 +352,7 @@ def objective(trial):
             
             if all(batch.empty for batch in batch_dict.values()):
                 continue
-            
+                
             data_A = to_tensor_tuple(batch_dict['A'], batch_dict['A'].columns)
             data_PDE = to_tensor_tuple(batch_dict['PDE'], ['x_PDE', 'y_PDE', 't_PDE'])
             data_N = to_tensor_tuple(batch_dict['N'], batch_dict['N'].columns)
@@ -267,65 +361,60 @@ def objective(trial):
             
             loss = pinn.train_step(optimizer, data_A, data_PDE, data_N, data_EW, data_NSEW)
             epoch_losses.append(loss.numpy())
-        
+            
         avg_loss = np.mean(epoch_losses)
-        if (epoch%print_checkpoint == 0):
-            print(f"Epoch: {epoch}/{max_epochs} - Loss: {avg_loss:.4e}")
-        # Report to Optuna for pruning
-        trial.report(avg_loss, epoch)
         
+        if epoch % print_checkpoint == 0:
+            print(f"Epoch: {epoch} - Training Loss: {avg_loss:.4e}")
+            
+        # Optional: Pruning based on training loss
+        trial.report(avg_loss, epoch)
         if trial.should_prune():
             raise optuna.TrialPruned()
-        
-        # Early stopping check
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-        
-        if patience_counter >= patience:
-            break
-    
-    training_time = time.time() - start_time
-    
-    # Calculate weighted score: accuracy (2x weight) and time (1x weight)
-    # Lower loss is better, lower time is better
-    score = 2.0 * best_loss + training_time / 1000.0  # Normalize time
-    
-    return score
 
+    # --- VALIDATION STEP ---
+    # After training, evaluate on the CFD data
+    total_mae, mae_u, mae_v, mae_p = validate_model(pinn)
+    
+    print(f"Validation MAE: Total={total_mae:.4f} (u={mae_u:.4f}, v={mae_v:.4f}, p={mae_p:.4f})")
+    
+    # validation as this is what we test on once models are fully trained
+    return total_mae
 
 def main():
-    """Run Optuna optimization."""
-    
-    # Create study
+    # Initialize Validation Data
+    load_validation_data_once()
+
+    # Create Study
     study = optuna.create_study(
         direction='minimize',
         pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=100)
     )
     
-    print("Starting hyperparameter optimization...")
-    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # First trial to match buhendwa baseline to compare hyperparam optimizations to this
+    first_trial_params = {
+        "n_layers": 8,
+        "n_neurons": 400,
+        "weight_m": 1.0,
+        "weight_u": 10.0,
+        "weight_v": 10.0,
+        "weight_a": 1.0
+    }
+    study.enqueue_trial(first_trial_params)
+    print("Enqueued first trial with params:", first_trial_params)
     
-    # Run optimization
-    study.optimize(objective, n_trials=50, timeout=None)
+    print("Starting optimization...")
+    study.optimize(objective, n_trials=50)
     
-    # Print results
     print("\n" + "="*50)
     print("OPTIMIZATION COMPLETE")
-    print("="*50)
-    print(f"\nBest trial: {study.best_trial.number}")
-    print(f"Best score: {study.best_value:.6e}")
-    print("\nBest hyperparameters:")
-    for key, value in study.best_params.items():
-        print(f"  {key}: {value}")
+    print(f"Best MAE: {study.best_value:.6f}")
+    print("Best Params:", study.best_params)
     
     # Save results
-    results_file = f"optuna_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    results_file = f"optuna_results_mae_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     study.trials_dataframe().to_csv(results_file, index=False)
-    print(f"\nResults saved to: {results_file}")
-
+    print(f"Results saved to {results_file}")
 
 if __name__ == "__main__":
     main()
