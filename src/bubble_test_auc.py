@@ -161,15 +161,18 @@ def main():
     pressure_cfd /= rho_ref
 
     # BUILD THE MODEL ARCHITECTURE
+    nodes_per_layer = 400
     inputs = tf.keras.Input(shape=(3,), name="input_tensor")
-    z = tf.keras.layers.Dense(400, activation='tanh')(inputs)
-    z = tf.keras.layers.Dense(400, activation='tanh')(z)
-    z = tf.keras.layers.Dense(400, activation='tanh')(z)
-    z = tf.keras.layers.Dense(400, activation='tanh')(z)
-    z = tf.keras.layers.Dense(400, activation='tanh')(z)
-    z = tf.keras.layers.Dense(400, activation='tanh')(z)
-    z = tf.keras.layers.Dense(400, activation='tanh')(z)
-    z = tf.keras.layers.Dense(400, activation='tanh')(z)
+    z = tf.keras.layers.Dense(nodes_per_layer, activation='tanh')(inputs)
+    z = tf.keras.layers.Dense(nodes_per_layer, activation='tanh')(z)
+    z = tf.keras.layers.Dense(nodes_per_layer, activation='tanh')(z)
+    z = tf.keras.layers.Dense(nodes_per_layer, activation='tanh')(z)
+    z = tf.keras.layers.Dense(nodes_per_layer, activation='tanh')(z)
+    z = tf.keras.layers.Dense(nodes_per_layer, activation='tanh')(z)
+    z = tf.keras.layers.Dense(nodes_per_layer, activation='tanh')(z)
+    z = tf.keras.layers.Dense(nodes_per_layer, activation='tanh')(z)
+    #comment out if not hyperparam tuned
+    #z = tf.keras.layers.Dense(nodes_per_layer, activation='tanh')(z)
 
     output_u = tf.keras.layers.Dense(1, activation='linear', name="output_u")(z)
     output_v = tf.keras.layers.Dense(1, activation='linear', name="output_v")(z)
@@ -179,7 +182,7 @@ def main():
     model = tf.keras.Model(inputs=inputs, outputs=[output_u, output_v, output_p, output_a])
 
     # LOAD TRAINED WEIGHTS
-    weights_path = "./hyperparam/hyperparam.weights.h5"
+    weights_path = "./geom/geom.weights.h5"
     if not os.path.exists(weights_path):
         print(f"Warning: Weights file {weights_path} not found.")
     else:

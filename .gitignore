@@ -10,3 +10,7 @@ typings/*
 pyrightconfig.json
 *.png
 *.gif
+*.csv
+*.h5
+*.log
+*.sh
