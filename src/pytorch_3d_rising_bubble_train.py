@@ -30,7 +30,8 @@ torch.manual_seed(1234)
 
 Physics = namedtuple(
     "Physics",
-    ["mu1", "mu2", "sigma", "g", "rho1", "rho2", "U_ref", "L_ref", "rho_ref", "loss_weights_PDE"],
+    ["mu1", "mu2", "sigma", "g", "rho1", "rho2", "U_ref", "L_ref", "rho_ref", "rho_mean",
+     "loss_weights_PDE"],
 )
 
 
@@ -146,21 +147,45 @@ def PDE_caller(model, physics, x, y, z, t):
             one_We * curvature * a_y - one_Re * (v_xx + v_yy + v_zz) - \
             2.0 * one_Re_y * v_y - one_Re_x * (u_y + v_x) - one_Re_z * (v_z + w_y)
     # Gravity acts along z, so the body-force term lives in the w-momentum equation.
+    #
+    # REDUCED GRAVITY. The LBPM domain is triply periodic (Domain/BC = 0), so p is
+    # periodic and grad(p) has zero volume average -- there is no mean pressure
+    # gradient available to balance a mean body force. Using the full rho*g would
+    # leave an unbalanced mean forcing of <rho>/rho_ref * (1/Fr) that nothing can
+    # cancel except a uniform acceleration, which the data rules out (the domain-mean
+    # w is constant in time). LBPM removes the mean force itself, so only the density
+    # deviation from the volume average drives the flow. The 2D case never needed this:
+    # its north boundary was a pressure Dirichlet, which does permit a mean vertical
+    # pressure gradient. If the .db is ever switched to a pressure BC in z, drop this
+    # correction and use rho directly, as the 2D script does.
+    rho_reduced = rho - physics.rho_mean
     PDE_w = (w_t + u * w_x + v * w_y + w * w_z) * rho / physics.rho_ref + p_z - \
             one_We * curvature * a_z - one_Re * (w_xx + w_yy + w_zz) - \
-            rho / physics.rho_ref * one_Fr - 2.0 * one_Re_z * w_z - \
+            rho_reduced / physics.rho_ref * one_Fr - 2.0 * one_Re_z * w_z - \
             one_Re_x * (u_z + w_x) - one_Re_y * (v_z + w_y)
 
     return PDE_m, PDE_u, PDE_v, PDE_w, PDE_a
 
 
-def compute_loss(model, physics, data_A, data_PDE, data_TOP, data_NOSLIP, data_XPER, data_YPER):
+def periodic_mismatch(model, plus_coords, minus_coords, t):
+    """Squared mismatch in u, v, w and p between the two faces of a periodic pair."""
+    x_p, y_p, z_p = plus_coords
+    x_m, y_m, z_m = minus_coords
+    pred_plus = model(torch.cat([x_p, y_p, z_p, t], dim=1))
+    pred_minus = model(torch.cat([x_m, y_m, z_m, t], dim=1))
+    loss = 0.0
+    for i in range(4):  # u, v, w, p
+        loss = loss + torch.mean((pred_plus[i] - pred_minus[i]) ** 2)
+    return loss
+
+
+def compute_loss(model, physics, data_A, data_PDE, data_XPER, data_YPER, data_ZPER, data_GAUGE):
     x_A, y_A, z_A, t_A, a_A = data_A
     x_PDE, y_PDE, z_PDE, t_PDE = data_PDE
-    x_TOP, y_TOP, z_TOP, t_TOP, u_TOP, v_TOP, w_TOP, p_TOP = data_TOP
-    x_NS, y_NS, z_NS, t_NS, u_NS, v_NS, w_NS = data_NOSLIP
     x_Xp, y_Xp, z_Xp, x_Xm, y_Xm, z_Xm, t_XPER = data_XPER
     x_Yp, y_Yp, z_Yp, x_Ym, y_Ym, z_Ym, t_YPER = data_YPER
+    x_Zp, y_Zp, z_Zp, x_Zm, y_Zm, z_Zm, t_ZPER = data_ZPER
+    x_G, y_G, z_G, t_G, p_G = data_GAUGE
 
     f_PDE = torch.zeros_like(x_PDE)
 
@@ -168,35 +193,18 @@ def compute_loss(model, physics, data_A, data_PDE, data_TOP, data_NOSLIP, data_X
     _, _, _, _, pred_a_A = model(torch.cat([x_A, y_A, z_A, t_A], dim=1))
     loss_a_A = torch.mean((a_A - pred_a_A) ** 2)
 
-    # Loss NOSLIP (No-slip walls at z_min and z_max)
-    pred_u_NS, pred_v_NS, pred_w_NS, _, _ = model(torch.cat([x_NS, y_NS, z_NS, t_NS], dim=1))
-    loss_u_NS = torch.mean((u_NS - pred_u_NS) ** 2)
-    loss_v_NS = torch.mean((v_NS - pred_v_NS) ** 2)
-    loss_w_NS = torch.mean((w_NS - pred_w_NS) ** 2)
+    # Loss XPER/YPER/ZPER. The LBPM run sets Domain/BC = 0, so all six faces are
+    # periodic; there are no walls and no pressure outlet.
+    loss_XPER = periodic_mismatch(model, (x_Xp, y_Xp, z_Xp), (x_Xm, y_Xm, z_Xm), t_XPER)
+    loss_YPER = periodic_mismatch(model, (x_Yp, y_Yp, z_Yp), (x_Ym, y_Ym, z_Ym), t_YPER)
+    loss_ZPER = periodic_mismatch(model, (x_Zp, y_Zp, z_Zp), (x_Zm, y_Zm, z_Zm), t_ZPER)
 
-    # Loss TOP (Pressure at open/pressure boundary z = z_max)
-    _, _, _, pred_p_TOP, _ = model(torch.cat([x_TOP, y_TOP, z_TOP, t_TOP], dim=1))
-    loss_p_TOP = torch.mean((p_TOP - pred_p_TOP) ** 2)
+    # Loss GAUGE. With every face periodic the pressure is only determined up to an
+    # additive constant, so it is pinned at a single corner point.
+    _, _, _, pred_p_G, _ = model(torch.cat([x_G, y_G, z_G, t_G], dim=1))
+    loss_p_GAUGE = torch.mean((p_G - pred_p_G) ** 2)
 
-    # Loss XPER (Periodic boundary along x)
-    pred_x_plus = model(torch.cat([x_Xp, y_Xp, z_Xp, t_XPER], dim=1))
-    pred_x_minus = model(torch.cat([x_Xm, y_Xm, z_Xm, t_XPER], dim=1))
-    loss_u_XPER = torch.mean((pred_x_plus[0] - pred_x_minus[0]) ** 2)
-    loss_v_XPER = torch.mean((pred_x_plus[1] - pred_x_minus[1]) ** 2)
-    loss_w_XPER = torch.mean((pred_x_plus[2] - pred_x_minus[2]) ** 2)
-    loss_p_XPER = torch.mean((pred_x_plus[3] - pred_x_minus[3]) ** 2)
-
-    # Loss YPER (Periodic boundary along y)
-    pred_y_plus = model(torch.cat([x_Yp, y_Yp, z_Yp, t_YPER], dim=1))
-    pred_y_minus = model(torch.cat([x_Ym, y_Ym, z_Ym, t_YPER], dim=1))
-    loss_u_YPER = torch.mean((pred_y_plus[0] - pred_y_minus[0]) ** 2)
-    loss_v_YPER = torch.mean((pred_y_plus[1] - pred_y_minus[1]) ** 2)
-    loss_w_YPER = torch.mean((pred_y_plus[2] - pred_y_minus[2]) ** 2)
-    loss_p_YPER = torch.mean((pred_y_plus[3] - pred_y_minus[3]) ** 2)
-
-    loss_BC = (loss_u_NS + loss_v_NS + loss_w_NS + loss_p_TOP +
-               loss_u_XPER + loss_v_XPER + loss_w_XPER + loss_p_XPER +
-               loss_u_YPER + loss_v_YPER + loss_w_YPER + loss_p_YPER)
+    loss_BC = loss_XPER + loss_YPER + loss_ZPER + loss_p_GAUGE
 
     # Loss PDE (Physics-Informed)
     PDE_m, PDE_u, PDE_v, PDE_w, PDE_a = PDE_caller(model, physics, x_PDE, y_PDE, z_PDE, t_PDE)
@@ -216,9 +224,9 @@ def compute_loss(model, physics, data_A, data_PDE, data_TOP, data_NOSLIP, data_X
     return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a
 
 
-def train_step(model, optimizer, physics, data_A, data_PDE, data_TOP, data_NOSLIP, data_XPER, data_YPER):
+def train_step(model, optimizer, physics, data_A, data_PDE, data_XPER, data_YPER, data_ZPER, data_GAUGE):
     optimizer.zero_grad()
-    losses = compute_loss(model, physics, data_A, data_PDE, data_TOP, data_NOSLIP, data_XPER, data_YPER)
+    losses = compute_loss(model, physics, data_A, data_PDE, data_XPER, data_YPER, data_ZPER, data_GAUGE)
     losses[0].backward()
     optimizer.step()
     return losses
@@ -281,13 +289,14 @@ def to_tensor_tuple(df, columns, device):
 
 
 def build_batch_tensors(batch_dict, device):
+    # The pressure gauge is not batched -- it is a single spatial point over a handful
+    # of times and is fed whole on every step (see data_GAUGE in main()).
     return (
         to_tensor_tuple(batch_dict['A'], batch_dict['A'].columns, device),
         to_tensor_tuple(batch_dict['PDE'], ['x_PDE', 'y_PDE', 'z_PDE', 't_PDE'], device),
-        to_tensor_tuple(batch_dict['TOP'], batch_dict['TOP'].columns, device),
-        to_tensor_tuple(batch_dict['NOSLIP'], batch_dict['NOSLIP'].columns, device),
         to_tensor_tuple(batch_dict['XPER'], ['x_Xp', 'y_Xp', 'z_Xp', 'x_Xm', 'y_Xm', 'z_Xm', 't_XPER'], device),
         to_tensor_tuple(batch_dict['YPER'], ['x_Yp', 'y_Yp', 'z_Yp', 'x_Ym', 'y_Ym', 'z_Ym', 't_YPER'], device),
+        to_tensor_tuple(batch_dict['ZPER'], ['x_Zp', 'y_Zp', 'z_Zp', 'x_Zm', 'y_Zm', 'z_Zm', 't_ZPER'], device),
     )
 
 
@@ -326,12 +335,14 @@ def main():
 
     NOP_a = (500, 400)
     NOP_PDE = (400, 2000, 3000)
-    NOP_top = (20, 20)
-    NOP_bottom = (20, 20)
-    NOP_xper = (20, 20)
-    NOP_yper = (20, 20)
+    # A 3D periodic face is a surface, not an edge, so it needs far more than the 20
+    # spatial points the 2D script used per boundary.
+    NOP_xper = (400, 20)
+    NOP_yper = (400, 20)
+    NOP_zper = (400, 20)
 
-    training_data = get_training_data_3d(NOP_a, NOP_PDE, NOP_top, NOP_bottom, NOP_xper, NOP_yper)
+    training_data, gauge_df, scales = get_training_data_3d(
+        NOP_a, NOP_PDE, NOP_xper, NOP_yper, NOP_zper)
 
     # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
@@ -362,18 +373,29 @@ def main():
                 "weights exist yet for the 3D case (initial_weights_3d.h5 is a Keras checkpoint "
                 "and isn't portable to this architecture).")
 
-    mu = [1.0, 10.0]
-    sigma = 24.5
-    g = -0.98
-    rho = [100, 1000]
-    u_ref = 1.0
-    L_ref = 0.25
+    # Physical parameters of the LBPM run (t14_forced_sphere.db), together with the
+    # reference scales measured from the dataset. These replace the 2D Hysing benchmark
+    # values, which were SI quantities for a light bubble in water and had no
+    # correspondence to this lattice-unit run of a dense drop in gas.
+    mu = scales["mu"]            # [drop, carrier] dynamic viscosity = rho * nu
+    sigma = scales["sigma"]      # measured by Laplace's law (emergent from the PR EOS)
+    g = scales["g"]              # Color/F = 0,0,+2e-6, per unit mass, along +z
+    rho = scales["rho"]          # [rhoA drop, rhoB carrier]
+    u_ref = scales["U_ref"]
+    L_ref = scales["L_ref"]
+    logger.info(f"Reference scales: L_ref={L_ref:.4f} cells, U_ref={u_ref:.6g} cells/step, "
+                f"T_ref={scales['T_ref']:.1f} steps")
+    logger.info(f"mu={mu}, rho={rho}, sigma={sigma}, g={g}, rho_mean={scales['rho_mean']:.5f}")
     loss_weights_PDE = [1.0, 10.0, 10.0, 10.0, 1.0]
     physics = Physics(
         mu1=mu[0], mu2=mu[1], sigma=sigma, g=g, rho1=rho[0], rho2=rho[1],
-        U_ref=u_ref, L_ref=L_ref, rho_ref=rho[1],
+        U_ref=u_ref, L_ref=L_ref, rho_ref=rho[1], rho_mean=scales["rho_mean"],
         loss_weights_PDE=torch.tensor(loss_weights_PDE, dtype=torch.float32, device=device),
     )
+
+    # Fed whole on every step rather than batched -- a proportional batch would round the
+    # 40-row gauge down to one or two rows and make it unreliably sampled.
+    data_GAUGE = to_tensor_tuple(gauge_df, gauge_df.columns, device)
 
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
@@ -414,8 +436,9 @@ def main():
                 if all(batch.empty for batch in batch_dict.values()):
                     continue
 
-                data_A, data_PDE, data_TOP, data_NOSLIP, data_XPER, data_YPER = build_batch_tensors(batch_dict, device)
-                losses = train_step(model, optimizer, physics, data_A, data_PDE, data_TOP, data_NOSLIP, data_XPER, data_YPER)
+                data_A, data_PDE, data_XPER, data_YPER, data_ZPER = build_batch_tensors(batch_dict, device)
+                losses = train_step(model, optimizer, physics, data_A, data_PDE,
+                                    data_XPER, data_YPER, data_ZPER, data_GAUGE)
                 epoch_losses.append([l.item() for l in losses])
 
             mean_losses = torch.tensor(np.mean(epoch_losses, axis=0), dtype=torch.float64, device=device)
@@ -475,11 +498,12 @@ def main():
             if all(batch.empty for batch in batch_dict.values()):
                 continue
 
-            data_A, data_PDE, data_TOP, data_NOSLIP, data_XPER, data_YPER = build_batch_tensors(batch_dict, device)
+            data_A, data_PDE, data_XPER, data_YPER, data_ZPER = build_batch_tensors(batch_dict, device)
             # Not wrapped in torch.no_grad(): the PDE residual needs first/second
             # derivatives of the network output w.r.t. its inputs, which requires
             # autograd to be active even though we never call .backward() here.
-            batch_losses = compute_loss(underlying_net, physics, data_A, data_PDE, data_TOP, data_NOSLIP, data_XPER, data_YPER)
+            batch_losses = compute_loss(underlying_net, physics, data_A, data_PDE,
+                                        data_XPER, data_YPER, data_ZPER, data_GAUGE)
             final_evaluation_losses.append([l.item() for l in batch_losses])
 
         avg_final_losses = np.mean(final_evaluation_losses, axis=0)
