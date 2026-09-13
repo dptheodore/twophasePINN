@@ -1,10 +1,15 @@
 import sys
 sys.path.append("../utilities")
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# '1' filters the routine oneDNN/absl chatter but KEEPS warnings and errors. Do not
+# raise this to '3': that also hides the "Cannot dlopen some GPU libraries" message,
+# which turns a CUDA misconfiguration into a silent fall back to CPU.
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 GPU_ID = "0"
 os.environ["CUDA_VISIBLE_DEVICES"] = GPU_ID
+# Set REQUIRE_GPU=0 to allow a (very slow) CPU run.
+REQUIRE_GPU = os.environ.get("REQUIRE_GPU", "1") == "1"
 
 import tensorflow as tf
 import numpy as np
@@ -26,6 +31,33 @@ from tensorflow.keras.utils import get_custom_objects
 def sine_activation(x):
     return K.sin(x)
 get_custom_objects().update({'sine': sine_activation})
+
+
+
+def check_gpu():
+    """Fails fast if TF fell back to CPU.
+
+    The 3D case is heavy enough that a silent CPU fallback would waste hours of
+    instance time before anyone noticed. If TF cannot find the pip-installed CUDA
+    wheels it reports only "Cannot dlopen some GPU libraries" and carries on, so
+    this turns that into a hard stop with the actual remedy.
+    """
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        print(f"Training on: {[g.name for g in gpus]}")
+        return
+    msg = (
+        "\nNo GPU visible to TensorFlow -- refusing to train on CPU.\n"
+        "If nvidia-smi works and the nvidia-* pip wheels are installed, TensorFlow\n"
+        "most likely did not add them to the dynamic loader path. Launch via\n"
+        "    ./run_3d.sh\n"
+        "which exports LD_LIBRARY_PATH before Python starts (it cannot be set from\n"
+        "inside this process -- glibc reads it only at startup).\n"
+        "Set REQUIRE_GPU=0 to override and run on CPU anyway.\n"
+    )
+    if REQUIRE_GPU:
+        raise SystemExit(msg)
+    print(msg)
 
 
 # Set random seeds for reproducibility
@@ -328,6 +360,8 @@ def main():
     """
     This script trains a PINN for the 3D rising bubble case.
     """
+    check_gpu()
+
     dirname, logpath = setup_output_directory()
     logger = get_logger(logpath)
 
