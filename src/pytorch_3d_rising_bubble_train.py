@@ -30,7 +30,7 @@ torch.manual_seed(1234)
 
 Physics = namedtuple(
     "Physics",
-    ["mu1", "mu2", "sigma", "g", "rho1", "rho2", "U_ref", "L_ref", "rho_ref", "rho_mean",
+    ["mu1", "mu2", "sigma", "g", "rho1", "rho2", "U_ref", "L_ref", "rho_ref",
      "loss_weights_PDE"],
 )
 
@@ -148,43 +148,36 @@ def PDE_caller(model, physics, x, y, z, t):
             2.0 * one_Re_y * v_y - one_Re_x * (u_y + v_x) - one_Re_z * (v_z + w_y)
     # Gravity acts along z, so the body-force term lives in the w-momentum equation.
     #
-    # REDUCED GRAVITY. The LBPM domain is triply periodic (Domain/BC = 0), so p is
-    # periodic and grad(p) has zero volume average -- there is no mean pressure
-    # gradient available to balance a mean body force. Using the full rho*g would
-    # leave an unbalanced mean forcing of <rho>/rho_ref * (1/Fr) that nothing can
-    # cancel except a uniform acceleration, which the data rules out (the domain-mean
-    # w is constant in time). LBPM removes the mean force itself, so only the density
-    # deviation from the volume average drives the flow. The 2D case never needed this:
-    # its north boundary was a pressure Dirichlet, which does permit a mean vertical
-    # pressure gradient. If the .db is ever switched to a pressure BC in z, drop this
-    # correction and use rho directly, as the 2D script does.
-    rho_reduced = rho - physics.rho_mean
+    # FULL GRAVITY, exactly as the 2D script does it.
+    #
+    # An earlier revision used a reduced gravity (rho - rho_mean) here. The argument was
+    # that the domain is triply periodic, so p is periodic, grad(p) has zero volume
+    # average, and a mean body force therefore cannot be balanced -- unless the whole
+    # domain accelerates uniformly, which that revision asserted the data ruled out
+    # ("the domain-mean w is constant in time").
+    #
+    # The current dataset falsifies the premise, not the reasoning: the domain-mean w is
+    # NOT constant, it ramps from 7e-6 to 2.0e-2 cells/step. The measured bulk
+    # acceleration is 1.98e-6 cells/step^2 against a body force of 2.0e-6, i.e.
+    # dw/dt = g to within 1.2%. Nothing removes the mean force; the fluid simply
+    # accelerates, and both phases accelerate together (drop-to-carrier slip is 0.2% of
+    # sqrt(g'D)), which is why the drop barely rises relative to its surroundings.
+    #
+    # That is precisely what the volume mean of this equation asks for with full gravity:
+    # <rho/rho_ref * w_t> balances <rho/rho_ref> * (1/Fr) while <p_z> = 0. Subtracting
+    # rho_mean would instead demand a mean acceleration of zero, which the data
+    # contradicts directly.
     PDE_w = (w_t + u * w_x + v * w_y + w * w_z) * rho / physics.rho_ref + p_z - \
             one_We * curvature * a_z - one_Re * (w_xx + w_yy + w_zz) - \
-            rho_reduced / physics.rho_ref * one_Fr - 2.0 * one_Re_z * w_z - \
+            rho / physics.rho_ref * one_Fr - 2.0 * one_Re_z * w_z - \
             one_Re_x * (u_z + w_x) - one_Re_y * (v_z + w_y)
 
     return PDE_m, PDE_u, PDE_v, PDE_w, PDE_a
 
 
-def periodic_mismatch(model, plus_coords, minus_coords, t):
-    """Squared mismatch in u, v, w and p between the two faces of a periodic pair."""
-    x_p, y_p, z_p = plus_coords
-    x_m, y_m, z_m = minus_coords
-    pred_plus = model(torch.cat([x_p, y_p, z_p, t], dim=1))
-    pred_minus = model(torch.cat([x_m, y_m, z_m, t], dim=1))
-    loss = 0.0
-    for i in range(4):  # u, v, w, p
-        loss = loss + torch.mean((pred_plus[i] - pred_minus[i]) ** 2)
-    return loss
-
-
-def compute_loss(model, physics, data_A, data_PDE, data_XPER, data_YPER, data_ZPER, data_GAUGE):
+def compute_loss(model, physics, data_A, data_PDE, data_GAUGE):
     x_A, y_A, z_A, t_A, a_A = data_A
     x_PDE, y_PDE, z_PDE, t_PDE = data_PDE
-    x_Xp, y_Xp, z_Xp, x_Xm, y_Xm, z_Xm, t_XPER = data_XPER
-    x_Yp, y_Yp, z_Yp, x_Ym, y_Ym, z_Ym, t_YPER = data_YPER
-    x_Zp, y_Zp, z_Zp, x_Zm, y_Zm, z_Zm, t_ZPER = data_ZPER
     x_G, y_G, z_G, t_G, p_G = data_GAUGE
 
     f_PDE = torch.zeros_like(x_PDE)
@@ -193,18 +186,19 @@ def compute_loss(model, physics, data_A, data_PDE, data_XPER, data_YPER, data_ZP
     _, _, _, _, pred_a_A = model(torch.cat([x_A, y_A, z_A, t_A], dim=1))
     loss_a_A = torch.mean((a_A - pred_a_A) ** 2)
 
-    # Loss XPER/YPER/ZPER. The LBPM run sets Domain/BC = 0, so all six faces are
-    # periodic; there are no walls and no pressure outlet.
-    loss_XPER = periodic_mismatch(model, (x_Xp, y_Xp, z_Xp), (x_Xm, y_Xm, z_Xm), t_XPER)
-    loss_YPER = periodic_mismatch(model, (x_Yp, y_Yp, z_Yp), (x_Ym, y_Ym, z_Ym), t_YPER)
-    loss_ZPER = periodic_mismatch(model, (x_Zp, y_Zp, z_Zp), (x_Zm, y_Zm, z_Zm), t_ZPER)
-
-    # Loss GAUGE. With every face periodic the pressure is only determined up to an
-    # additive constant, so it is pinned at a single corner point.
+    # Loss GAUGE. The LBPM run sets Domain/BC = 0, so all six faces are periodic; there
+    # are no walls and no pressure outlet. Periodicity is now exact by construction --
+    # the network takes a sin/cos embedding of x, y and z with the domain lengths as
+    # periods (see get_model_dnn(periodic_lengths=...)), which makes every output and
+    # every derivative periodic identically. That replaces the XPER/YPER/ZPER face-pair
+    # mismatch losses this script used to carry, matching the TensorFlow version.
+    #
+    # With every face periodic the pressure is only determined up to an additive
+    # constant, so it is pinned at a single corner point. That is the only BC left.
     _, _, _, pred_p_G, _ = model(torch.cat([x_G, y_G, z_G, t_G], dim=1))
     loss_p_GAUGE = torch.mean((p_G - pred_p_G) ** 2)
 
-    loss_BC = loss_XPER + loss_YPER + loss_ZPER + loss_p_GAUGE
+    loss_BC = loss_p_GAUGE
 
     # Loss PDE (Physics-Informed)
     PDE_m, PDE_u, PDE_v, PDE_w, PDE_a = PDE_caller(model, physics, x_PDE, y_PDE, z_PDE, t_PDE)
@@ -224,9 +218,9 @@ def compute_loss(model, physics, data_A, data_PDE, data_XPER, data_YPER, data_ZP
     return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a
 
 
-def train_step(model, optimizer, physics, data_A, data_PDE, data_XPER, data_YPER, data_ZPER, data_GAUGE):
+def train_step(model, optimizer, physics, data_A, data_PDE, data_GAUGE):
     optimizer.zero_grad()
-    losses = compute_loss(model, physics, data_A, data_PDE, data_XPER, data_YPER, data_ZPER, data_GAUGE)
+    losses = compute_loss(model, physics, data_A, data_PDE, data_GAUGE)
     losses[0].backward()
     optimizer.step()
     return losses
@@ -294,9 +288,6 @@ def build_batch_tensors(batch_dict, device):
     return (
         to_tensor_tuple(batch_dict['A'], batch_dict['A'].columns, device),
         to_tensor_tuple(batch_dict['PDE'], ['x_PDE', 'y_PDE', 'z_PDE', 't_PDE'], device),
-        to_tensor_tuple(batch_dict['XPER'], ['x_Xp', 'y_Xp', 'z_Xp', 'x_Xm', 'y_Xm', 'z_Xm', 't_XPER'], device),
-        to_tensor_tuple(batch_dict['YPER'], ['x_Yp', 'y_Yp', 'z_Yp', 'x_Ym', 'y_Ym', 'z_Ym', 't_YPER'], device),
-        to_tensor_tuple(batch_dict['ZPER'], ['x_Zp', 'y_Zp', 'z_Zp', 'x_Zm', 'y_Zm', 'z_Zm', 't_ZPER'], device),
     )
 
 
@@ -335,14 +326,8 @@ def main():
 
     NOP_a = (500, 400)
     NOP_PDE = (400, 2000, 3000)
-    # A 3D periodic face is a surface, not an edge, so it needs far more than the 20
-    # spatial points the 2D script used per boundary.
-    NOP_xper = (400, 20)
-    NOP_yper = (400, 20)
-    NOP_zper = (400, 20)
 
-    training_data, gauge_df, scales = get_training_data_3d(
-        NOP_a, NOP_PDE, NOP_xper, NOP_yper, NOP_zper)
+    training_data, gauge_df, scales = get_training_data_3d(NOP_a, NOP_PDE)
 
     # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
@@ -361,8 +346,12 @@ def main():
     ]
 
     nn_creator = NNCreator(torch.float32)
-    net = nn_creator.get_model_dnn(4, hidden_layers, output_layer, activation_functions_dict, False)
+    # `periodic_lengths` makes the network periodic in x, y and z by construction,
+    # replacing the face-pair mismatch losses (see compute_loss).
+    net = nn_creator.get_model_dnn(4, hidden_layers, output_layer, activation_functions_dict, False,
+                                   periodic_lengths=scales["period"])
     net.to(device)
+    logger.info(f"Periodic lengths (nondimensional): {scales['period']}")
 
     if is_distributed:
         model = DDP(net, device_ids=[local_rank] if torch.cuda.is_available() else None)
@@ -389,7 +378,7 @@ def main():
     loss_weights_PDE = [1.0, 10.0, 10.0, 10.0, 1.0]
     physics = Physics(
         mu1=mu[0], mu2=mu[1], sigma=sigma, g=g, rho1=rho[0], rho2=rho[1],
-        U_ref=u_ref, L_ref=L_ref, rho_ref=rho[1], rho_mean=scales["rho_mean"],
+        U_ref=u_ref, L_ref=L_ref, rho_ref=rho[1],
         loss_weights_PDE=torch.tensor(loss_weights_PDE, dtype=torch.float32, device=device),
     )
 
@@ -436,9 +425,8 @@ def main():
                 if all(batch.empty for batch in batch_dict.values()):
                     continue
 
-                data_A, data_PDE, data_XPER, data_YPER, data_ZPER = build_batch_tensors(batch_dict, device)
-                losses = train_step(model, optimizer, physics, data_A, data_PDE,
-                                    data_XPER, data_YPER, data_ZPER, data_GAUGE)
+                data_A, data_PDE = build_batch_tensors(batch_dict, device)
+                losses = train_step(model, optimizer, physics, data_A, data_PDE, data_GAUGE)
                 epoch_losses.append([l.item() for l in losses])
 
             mean_losses = torch.tensor(np.mean(epoch_losses, axis=0), dtype=torch.float64, device=device)
@@ -498,12 +486,11 @@ def main():
             if all(batch.empty for batch in batch_dict.values()):
                 continue
 
-            data_A, data_PDE, data_XPER, data_YPER, data_ZPER = build_batch_tensors(batch_dict, device)
+            data_A, data_PDE = build_batch_tensors(batch_dict, device)
             # Not wrapped in torch.no_grad(): the PDE residual needs first/second
             # derivatives of the network output w.r.t. its inputs, which requires
             # autograd to be active even though we never call .backward() here.
-            batch_losses = compute_loss(underlying_net, physics, data_A, data_PDE,
-                                        data_XPER, data_YPER, data_ZPER, data_GAUGE)
+            batch_losses = compute_loss(underlying_net, physics, data_A, data_PDE, data_GAUGE)
             final_evaluation_losses.append([l.item() for l in batch_losses])
 
         avg_final_losses = np.mean(final_evaluation_losses, axis=0)

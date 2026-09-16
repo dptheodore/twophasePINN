@@ -73,7 +73,7 @@ class TwoPhasePinn(tf.keras.Model):
 
     def __init__(self, hidden_layers, activation_functions, adaptive_activation_coeff,
                  adaptive_activation_n, adaptive_activation_init, use_ad_act,
-                 loss_weights_PDE, mu, sigma, g, rho, u_ref, L_ref, rho_mean):
+                 loss_weights_PDE, mu, sigma, g, rho, u_ref, L_ref, period):
         super(TwoPhasePinn, self).__init__()
 
         # Physical Parameters
@@ -84,8 +84,6 @@ class TwoPhasePinn(tf.keras.Model):
         self.U_ref = u_ref
         self.L_ref = L_ref
         self.rho_ref = self.rho2
-        # Volume-averaged density, used to remove the mean body force (see PDE_caller).
-        self.rho_mean = rho_mean
 
         # Loss weights
         self.loss_weights_PDE = tf.constant(loss_weights_PDE, dtype=tf.float32)
@@ -108,8 +106,12 @@ class TwoPhasePinn(tf.keras.Model):
         output_layer = list(zip(outputs, activations_output))
 
         # 3. Instantiate NNCreator and build the model
+        # The LBPM run sets Domain/BC = 0, so all six faces are periodic. `period` makes
+        # the network periodic in x, y and z by construction (values and every
+        # derivative), which replaces the old face-pair mismatch losses.
         nn_creator = NNCreator(tf.float32)
-        self.nn = nn_creator.get_model_dnn(4, hidden_layers, output_layer, activation_functions_dict, self.use_ad_act)
+        self.nn = nn_creator.get_model_dnn(4, hidden_layers, output_layer, activation_functions_dict, self.use_ad_act,
+                                           periodic_lengths=period)
 
     def _get_activation_function_dict(self, hidden_layers, activation_functions, adaptive_activation_coeff, adaptive_activation_n):
         """Helper to create the activation dictionary for NNCreator."""
@@ -224,44 +226,37 @@ class TwoPhasePinn(tf.keras.Model):
         # Gravity acts along z (see generate_points_3d.py), so the body-force term
         # lives in the w-momentum equation here instead of the v-momentum equation.
         #
-        # REDUCED GRAVITY. The LBPM domain is triply periodic (Domain/BC = 0), so p is
-        # periodic and grad(p) has zero volume average -- there is no mean pressure
-        # gradient available to balance a mean body force. Using the full rho*g would
-        # leave an unbalanced mean forcing of <rho>/rho_ref * (1/Fr) that nothing can
-        # cancel except a uniform acceleration, which the data rules out (the domain-mean
-        # w is constant in time). LBPM removes the mean force itself, so only the density
-        # deviation from the volume average drives the flow. The 2D case never needed this:
-        # its north boundary was a pressure Dirichlet, which does permit a mean vertical
-        # pressure gradient. If the .db is ever switched to a pressure BC in z, drop this
-        # correction and use rho directly, as the 2D script does.
-        rho_reduced = rho - self.rho_mean
+        # FULL GRAVITY, exactly as the 2D script does it.
+        #
+        # An earlier revision used a reduced gravity (rho - rho_mean) here. The argument
+        # was that the domain is triply periodic, so p is periodic, grad(p) has zero
+        # volume average, and a mean body force therefore cannot be balanced -- unless
+        # the whole domain accelerates uniformly, which that revision asserted the data
+        # ruled out ("the domain-mean w is constant in time").
+        #
+        # The current dataset falsifies the premise, not the reasoning: the domain-mean w
+        # is NOT constant, it ramps from 7e-6 to 2.0e-2 cells/step. The measured bulk
+        # acceleration is 1.98e-6 cells/step^2 against a body force of 2.0e-6, i.e.
+        # dw/dt = g to within 1.2%. Nothing removes the mean force; the fluid simply
+        # accelerates, and both phases accelerate together (drop-to-carrier slip is 0.2%
+        # of sqrt(g'D)), which is why the drop barely rises relative to its surroundings.
+        #
+        # That is precisely what the volume mean of this equation asks for with full
+        # gravity: <rho/rho_ref * w_t> balances <rho/rho_ref> * (1/Fr) while <p_z> = 0.
+        # Subtracting rho_mean would instead demand a mean acceleration of zero, which
+        # the data contradicts directly.
         PDE_w = (w_t + u * w_x + v * w_y + w * w_z) * rho / self.rho_ref + p_z - \
                 one_We * curvature * a_z - one_Re * (w_xx + w_yy + w_zz) - \
-                rho_reduced / self.rho_ref * one_Fr - 2.0 * one_Re_z * w_z - \
+                rho / self.rho_ref * one_Fr - 2.0 * one_Re_z * w_z - \
                 one_Re_x * (u_z + w_x) - one_Re_y * (v_z + w_y)
 
         return PDE_m, PDE_u, PDE_v, PDE_w, PDE_a
 
     @tf.function
-    def _periodic_mismatch(self, plus_coords, minus_coords, t):
-        ''' Squared mismatch in u, v, w and p between the two faces of a periodic pair. '''
-        x_p, y_p, z_p = plus_coords
-        x_m, y_m, z_m = minus_coords
-        pred_plus = self.call(tf.concat([x_p, y_p, z_p, t], axis=1))
-        pred_minus = self.call(tf.concat([x_m, y_m, z_m, t], axis=1))
-        loss = 0.0
-        for i in range(4):  # u, v, w, p
-            loss += tf.reduce_mean(tf.square(pred_plus[i] - pred_minus[i]))
-        return loss
-
-    @tf.function
-    def compute_loss(self, data_A, data_PDE, data_XPER, data_YPER, data_ZPER, data_GAUGE):
+    def compute_loss(self, data_A, data_PDE, data_GAUGE):
         # Unpack tensor tuples
         x_A, y_A, z_A, t_A, a_A = data_A
         x_PDE, y_PDE, z_PDE, t_PDE = data_PDE
-        x_Xp, y_Xp, z_Xp, x_Xm, y_Xm, z_Xm, t_XPER = data_XPER
-        x_Yp, y_Yp, z_Yp, x_Ym, y_Ym, z_Ym, t_YPER = data_YPER
-        x_Zp, y_Zp, z_Zp, x_Zm, y_Zm, z_Zm, t_ZPER = data_ZPER
         x_G, y_G, z_G, t_G, p_G = data_GAUGE
 
         f_PDE = tf.zeros_like(x_PDE)
@@ -270,18 +265,11 @@ class TwoPhasePinn(tf.keras.Model):
         output_tensors = self.call(tf.concat([x_A, y_A, z_A, t_A], axis=1))
         loss_a_A = tf.reduce_mean(tf.square(a_A - output_tensors[4]))
 
-        # Loss XPER/YPER/ZPER. The LBPM run sets Domain/BC = 0, so all six faces are
-        # periodic; there are no walls and no pressure outlet.
-        loss_XPER = self._periodic_mismatch((x_Xp, y_Xp, z_Xp), (x_Xm, y_Xm, z_Xm), t_XPER)
-        loss_YPER = self._periodic_mismatch((x_Yp, y_Yp, z_Yp), (x_Ym, y_Ym, z_Ym), t_YPER)
-        loss_ZPER = self._periodic_mismatch((x_Zp, y_Zp, z_Zp), (x_Zm, y_Zm, z_Zm), t_ZPER)
-
-        # Loss GAUGE. With every face periodic the pressure is only determined up to an
-        # additive constant, so it is pinned at a single corner point.
+        # Loss GAUGE. Periodicity is exact by construction (see __init__), so there is no
+        # boundary loss at all. With every face periodic the
+        # pressure is only determined up to an additive constant, pinned at one corner point.
         _, _, _, pred_p_G, _ = self.call(tf.concat([x_G, y_G, z_G, t_G], axis=1))
-        loss_p_GAUGE = tf.reduce_mean(tf.square(p_G - pred_p_G))
-
-        loss_BC = loss_XPER + loss_YPER + loss_ZPER + loss_p_GAUGE
+        loss_gauge = tf.reduce_mean(tf.square(p_G - pred_p_G))
 
         # Loss PDE (Physics-Informed)
         PDE_m, PDE_u, PDE_v, PDE_w, PDE_a = self.PDE_caller(x_PDE, y_PDE, z_PDE, t_PDE)
@@ -294,16 +282,16 @@ class TwoPhasePinn(tf.keras.Model):
         loss_PDE = tf.tensordot(tf.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a]), self.loss_weights_PDE, 1)
 
         # Total Loss
-        total_loss = loss_a_A + loss_BC + loss_PDE
+        total_loss = loss_a_A + loss_gauge + loss_PDE
 
-        return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a
+        return total_loss, loss_a_A, loss_gauge, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a
 
 
     @tf.function
-    def train_step(self, optimizer, data_A, data_PDE, data_XPER, data_YPER, data_ZPER, data_GAUGE):
+    def train_step(self, optimizer, data_A, data_PDE, data_GAUGE):
         with tf.GradientTape() as tape:
             # Pass the tensor tuples directly to compute_loss
-            losses = self.compute_loss(data_A, data_PDE, data_XPER, data_YPER, data_ZPER, data_GAUGE)
+            losses = self.compute_loss(data_A, data_PDE, data_GAUGE)
             total_loss = losses[0]
 
         gradients = tape.gradient(total_loss, self.trainable_variables)
@@ -367,14 +355,8 @@ def main():
 
     NOP_a = (500, 400)
     NOP_PDE = (400, 2000, 3000)
-    # A 3D periodic face is a surface, not an edge, so it needs far more than the 20
-    # spatial points the 2D script used per boundary.
-    NOP_xper = (400, 20)
-    NOP_yper = (400, 20)
-    NOP_zper = (400, 20)
 
-    training_data, gauge_df, scales = get_training_data_3d(
-        NOP_a, NOP_PDE, NOP_xper, NOP_yper, NOP_zper)
+    training_data, gauge_df, scales = get_training_data_3d(NOP_a, NOP_PDE)
 
     # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
@@ -443,7 +425,8 @@ def main():
 
     pinn = TwoPhasePinn(hidden_layers, activation_functions, adaptive_activation_coeff,
                       adaptive_activation_n, adaptive_activation_init, use_adaptive_activation,
-                      loss_weights_PDE, mu, sigma, g, rho, u_ref, L_ref, scales["rho_mean"])
+                      loss_weights_PDE, mu, sigma, g, rho, u_ref, L_ref, scales["period"])
+    logger.info(f"Periodic lengths (nondimensional): {scales['period']}")
 
     pinn.nn.load_weights('initial_weights_3d.h5')
 
@@ -492,15 +475,12 @@ def main():
 
                 data_A = to_tensor_tuple(batch_dict['A'], batch_dict['A'].columns)
                 data_PDE = to_tensor_tuple(batch_dict['PDE'], ['x_PDE', 'y_PDE', 'z_PDE', 't_PDE'])
-                data_XPER = to_tensor_tuple(batch_dict['XPER'], ['x_Xp', 'y_Xp', 'z_Xp', 'x_Xm', 'y_Xm', 'z_Xm', 't_XPER'])
-                data_YPER = to_tensor_tuple(batch_dict['YPER'], ['x_Yp', 'y_Yp', 'z_Yp', 'x_Ym', 'y_Ym', 'z_Ym', 't_YPER'])
-                data_ZPER = to_tensor_tuple(batch_dict['ZPER'], ['x_Zp', 'y_Zp', 'z_Zp', 'x_Zm', 'y_Zm', 'z_Zm', 't_ZPER'])
 
-                batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_XPER, data_YPER, data_ZPER, data_GAUGE)
+                batch_loss_values = pinn.train_step(optimizer, data_A, data_PDE, data_GAUGE)
                 epoch_losses.append([l.numpy() for l in batch_loss_values])
 
             sum_losses = np.sum(epoch_losses, axis=0)
-            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_losses
+            total_loss, loss_a, loss_gauge, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_losses
 
             history_loss_a.append(loss_a)
             history_loss_f_uvw.append(loss_u + loss_v + loss_w)
@@ -511,7 +491,7 @@ def main():
                 time_for_epoch = current_time - start_checkpoint_time
                 start_checkpoint_time = current_time
                 log_msg = f"Epoch: {epoch}/{epochs} - Time: {time_for_epoch:.2f}s - Loss: {total_loss:.4e}"
-                log_msg += f" | a: {loss_a:.4e}, BC: {loss_bc:.4e}, m: {loss_m:.4e}"
+                log_msg += f" | a: {loss_a:.4e}, gauge: {loss_gauge:.4e}, m: {loss_m:.4e}"
                 log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, w: {loss_w:.4e}, pde_a: {loss_pde_a:.4e}"
                 logger.info(log_msg)
 
@@ -557,21 +537,18 @@ def main():
 
         data_A = to_tensor_tuple(batch_dict['A'], batch_dict['A'].columns)
         data_PDE = to_tensor_tuple(batch_dict['PDE'], ['x_PDE', 'y_PDE', 'z_PDE', 't_PDE'])
-        data_XPER = to_tensor_tuple(batch_dict['XPER'], ['x_Xp', 'y_Xp', 'z_Xp', 'x_Xm', 'y_Xm', 'z_Xm', 't_XPER'])
-        data_YPER = to_tensor_tuple(batch_dict['YPER'], ['x_Yp', 'y_Yp', 'z_Yp', 'x_Ym', 'y_Ym', 'z_Ym', 't_YPER'])
-        data_ZPER = to_tensor_tuple(batch_dict['ZPER'], ['x_Zp', 'y_Zp', 'z_Zp', 'x_Zm', 'y_Zm', 'z_Zm', 't_ZPER'])
 
         # Compute loss for the batch without training
-        batch_losses = pinn.compute_loss(data_A, data_PDE, data_XPER, data_YPER, data_ZPER, data_GAUGE)
+        batch_losses = pinn.compute_loss(data_A, data_PDE, data_GAUGE)
         final_evaluation_losses.append([l.numpy() for l in batch_losses])
 
     # Calculate the mean loss across all batches
     sum_final_losses = np.sum(final_evaluation_losses, axis=0)
-    _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_final_losses
+    _, loss_a, loss_gauge, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_final_losses
 
     logger.info("--- Final Loss Breakdown ---")
     logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")
-    logger.info(f"MSE_BC                     : {loss_bc:.4e}")
+    logger.info(f"MSE_gauge (pressure)       : {loss_gauge:.4e}")
     logger.info(f"MSE_f,m                    : {loss_m:.4e}")
     logger.info(f"MSE_f,u                    : {loss_u:.4e}")
     logger.info(f"MSE_f,v                    : {loss_v:.4e}")

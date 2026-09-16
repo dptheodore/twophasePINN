@@ -18,15 +18,28 @@ Grid convention (see build-lbpm/compile_silo_to_h5.py):
     spherical drop into a 2:1 oblate ellipsoid. The .db now declares
     L = 1,1,2, but this module stays robust either way: each axis is divided
     by its own stored spacing, recovering cubic lattice cells regardless.
-  - Body force / gravity is applied along +Z (Color/F = 0, 0, 2e-6).
+  - Body force / gravity is applied along +Z (Color/F = 0, 0, 2e-6). Because the
+    box is triply periodic and the force acts PER UNIT MASS, both phases feel
+    the same acceleration and the whole domain accelerates together: the
+    measured bulk acceleration is 1.98e-6 cells/step^2 against the 2e-6 body
+    force, and drop-to-carrier slip is only 0.2% of sqrt(g'D). The drop
+    therefore never reaches a terminal velocity and barely rises relative to
+    its surroundings. Two consequences, both deliberate: U_ref is the buoyant
+    scale rather than the drop's own speed (see _measure_scales), and the
+    momentum equation uses FULL gravity rather than a reduced (rho - rho_mean)
+    one (see PDE_caller in 3d_rising_bubble_train.py).
   - The .db sets Domain/BC = 0, i.e. FULLY PERIODIC in x, y and z, with no
     solid geometry (nspheres = 0, NumberOfPlateSets = 0). The end planes are
     not walls: <w> on both z faces equals the bulk drift speed, and the two
     end planes match each other three orders of magnitude more closely than
-    an unrelated plane pair. All six faces are therefore treated as periodic
-    pairs, and the otherwise-undetermined pressure gauge is pinned at a
-    single corner point. If the .db is switched to a pressure BC in z, use
-    the 2D script's north-outlet structure instead.
+    an unrelated plane pair. Periodicity is built into the network itself
+    (a sin/cos embedding of x, y, z with the domain lengths as periods, see
+    utilities.NNCreator.get_model_dnn), so no face-pair points are generated;
+    scales["period"] carries those lengths. The otherwise-undetermined
+    pressure gauge is pinned at a single corner point. If the .db is switched
+    to a pressure BC in z, use the 2D script's north-outlet structure instead.
+  - T_MAX optionally discards trailing snapshots on load, before any scale is
+    measured. It is None for the current dataset, which is used whole.
   - Raw levelset convention is +8 = carrier phase, -8 = drop phase; it is
     negated below (as the 2D pipeline does) so that a > 0 => drop (a=1),
     matching the a=1 branch of mu/rho in 3d_rising_bubble_train.py. Note that
@@ -40,7 +53,10 @@ autograd derivatives to ~1e-11. Space and time are therefore scaled by
 references measured from the dataset itself (see _measure_scales):
 
     L_ref = drop radius from its equilibrium volume, in lattice cells
-    U_ref = bulk/centroid drift speed, in cells per timestep
+    U_ref = buoyant velocity scale sqrt(g' D), in cells per timestep, where
+            g' = |F_z| * |rhoA - rhoB| / rhoB (see _measure_scales -- the drop never
+            reaches a terminal velocity in this triply periodic box, so its own speed
+            is not a usable reference)
     T_ref = L_ref / U_ref
 
 which reproduces the O(1) input ranges the working 2D script feeds its network
@@ -67,6 +83,11 @@ BODY_FORCE_Z = 2e-6          # Color/F = 0,0,2e-6, applied per unit mass, along 
 # (set by pr_kappa and T_Tc) rather than given in the .db, so _measure_sigma
 # recovers it from the pressure field instead of trusting this number.
 SIGMA_FALLBACK = 0.0030722
+# Optional cap on the LBM timestep kept from the h5; None keeps every snapshot.
+# The current dataset spans t = 19600 .. 30000 and is used whole. Set this only to cut a
+# trailing transient -- a value below the FIRST stored timestep silently empties the
+# dataset, so get_training_data_3d raises instead of failing later on an empty array.
+T_MAX = None
 
 
 def _measure_sigma(levelset, pressure, R):
@@ -109,17 +130,41 @@ def _measure_scales(levelset, pressure, times):
     stale constants behind.
 
     L_ref is the drop radius implied by its equilibrium volume; early snapshots are
-    excluded because the drop is still equilibrating there. U_ref is the mean speed of
-    the drop centroid, which in this fully periodic box equals the bulk drift speed of
-    the whole domain. '''
+    excluded from the median because the drop may still be equilibrating there.
+
+    U_ref is the BUOYANT velocity scale sqrt(g' D), not the drop's own speed. Earlier
+    revisions used the mean centroid speed, which presumes the drop has reached a
+    terminal velocity. It has not, and cannot: the box is triply periodic and the body
+    force acts per unit mass, so both phases feel the same acceleration and the whole
+    domain drifts together. Measured on this dataset, drop-to-carrier slip is 1.8e-5
+    against a rise speed of ~1e-2 (0.2% of sqrt(g' D)), while the centroid speed ramps
+    linearly from 1e-5 to 1.95e-2 cells/step across the window. Averaging that ramp
+    yields a number set by where the window happens to start and stop, and it put 1/We
+    at 1.5 -- an order above the 2D benchmark's 0.098.
+
+    sqrt(g' D) is instead a property of the configuration, and reproduces the 2D
+    benchmark's groups closely: 1/Re(carrier) 0.050, 1/We 0.191, 1/Fr 0.054 against 2D's
+    0.040, 0.098, 0.245, with t spanning [0, 11.8] against 2D's [0, 12]. '''
 
     volumes = np.array([(snap > 0).sum() for snap in levelset], dtype=float)
     settled = volumes[len(volumes) // 3:]
     L_ref = (3.0 * np.median(settled) / (4.0 * np.pi)) ** (1.0 / 3.0)
 
+    g_prime = abs(BODY_FORCE_Z) * abs(RHO_DROP - RHO_GAS) / RHO_GAS
+    U_ref = float(np.sqrt(g_prime * 2.0 * L_ref))
+
+    # Diagnostics, printed rather than used: if a future dataset DOES reach a terminal
+    # velocity, the centroid speed will flatten and the bulk acceleration will fall well
+    # below the body force, and the choice above should be revisited.
     z_centroid = np.array([np.argwhere(snap > 0)[:, 0].mean() for snap in levelset])
     speed = np.gradient(z_centroid, times)
-    U_ref = float(np.mean(speed[len(speed) // 4: -2]))
+    bulk_accel = float(np.polyfit(times, speed, 1)[0])
+    print("  centroid speed %.4g -> %.4g cells/step (buoyant scale sqrt(g'D) = %.4g)"
+          % (speed[0], speed[-1], U_ref))
+    print("  bulk acceleration %.3g per step vs body force %.3g (ratio %.2f): %s"
+          % (bulk_accel, BODY_FORCE_Z, bulk_accel / BODY_FORCE_Z,
+             "still accelerating, no terminal velocity"
+             if abs(bulk_accel / BODY_FORCE_Z) > 0.5 else "approaching terminal velocity"))
 
     # Volume-averaged drop fraction, for the reduced-gravity correction in the momentum
     # equation (the domain is triply periodic, so the mean body force must be removed).
@@ -245,61 +290,6 @@ def get_points_pde_3d(NOP, times, X, Y, Z, cell_size, interface_all, normal_all,
     return data
 
 
-def _periodic_face_grid(NOP, coord1_bounds, coord2_bounds, t_bounds):
-    ''' Deterministic (non-random) 2D spatial grid + time samples shared by both faces
-    of a periodic pair, so that the plus/minus faces line up row-for-row. '''
-    n1 = max(1, round(math.sqrt(NOP[0])))
-    n2 = max(1, math.ceil(NOP[0] / n1))
-    c1 = np.linspace(coord1_bounds[0], coord1_bounds[1], n1)
-    c2 = np.linspace(coord2_bounds[0], coord2_bounds[1], n2)
-    C1, C2 = np.meshgrid(c1, c2, indexing="ij")
-    C1 = C1.reshape(-1, 1)
-    C2 = C2.reshape(-1, 1)
-    t_vals = np.linspace(t_bounds[0], t_bounds[1], NOP[1])
-    return C1, C2, t_vals
-
-
-def _periodic_pair(NOP, free1, free2, pinned, axis, t_bounds):
-    ''' Builds one periodic face pair. `axis` is the index (0/1/2) of the coordinate
-    held at its two extremes, `pinned` its (min, max) bounds, and free1/free2 the
-    bounds of the two coordinates spanning the face. Columns are
-    [x+, y+, z+, x-, y-, z-, t]. '''
-    A, B, t_vals = _periodic_face_grid(NOP, free1, free2, t_bounds)
-    n_space = len(A)
-    free_axes = [i for i in range(3) if i != axis]
-
-    plus = np.empty((n_space, 3))
-    minus = np.empty((n_space, 3))
-    plus[:, free_axes[0]] = A[:, 0]
-    plus[:, free_axes[1]] = B[:, 0]
-    minus[:, free_axes[0]] = A[:, 0]
-    minus[:, free_axes[1]] = B[:, 0]
-    plus[:, axis] = pinned[1]
-    minus[:, axis] = pinned[0]
-
-    rows = [np.hstack([plus, minus, time_value * np.ones((n_space, 1))]) for time_value in t_vals]
-    return np.vstack(rows)
-
-
-def get_x_periodic(NOP, x, y, z, t):
-    ''' Periodic pair at x = x_min / x_max, sampled over a shared (y, z) grid. '''
-    return _periodic_pair(NOP, y, z, x, 0, t)
-
-
-def get_y_periodic(NOP, x, y, z, t):
-    ''' Periodic pair at y = y_min / y_max, sampled over a shared (x, z) grid. '''
-    return _periodic_pair(NOP, x, z, y, 1, t)
-
-
-def get_z_periodic(NOP, x, y, z, t):
-    ''' Periodic pair at z = z_min / z_max, sampled over a shared (x, y) grid.
-
-    This replaces the old get_top/get_bottom pressure-outlet + no-slip-wall pair. The
-    LBPM run is periodic in z, the drop reaches z_max within the data window, and both
-    end planes carry the full bulk drift velocity, so no-slip there is not available. '''
-    return _periodic_pair(NOP, x, y, z, 2, t)
-
-
 def get_pressure_gauge(NOP_t, x, y, z, t, p_value=1.0):
     ''' With every face periodic there is no Dirichlet pressure anywhere, leaving the
     pressure determined only up to an additive constant. This pins the gauge at a
@@ -354,33 +344,50 @@ def compute_normals_3d(X, Y, Z, levelset, dx, dy, dz):
     return interface, normal, tangent1, tangent2
 
 
-def get_training_data_3d(NOP_A, NOP_PDE, NOP_xper, NOP_yper, NOP_zper, NOP_gauge=40,
+def get_training_data_3d(NOP_A, NOP_PDE, NOP_gauge=40,
                           h5_path="../cfd_data/lbpm_bubble_dataset.h5", time_indices=None):
     ''' Generates the training points for all losses from the LBPM 3D drop dataset.
 
     Args:
         NOP_A: (interface, domain) point counts for the volume fraction loss, per snapshot
         NOP_PDE: (interface, nearfield, domain) point counts for the PDE residual, per snapshot
-        NOP_xper/NOP_yper/NOP_zper: (spatial, time) point counts for each periodic face pair
         NOP_gauge: number of times at which the single-point pressure gauge is imposed
         h5_path: path to lbpm_bubble_dataset.h5
-        time_indices: optional explicit array of time-snapshot indices to use; if None,
-            every second snapshot is taken, skipping index 0 (the drop is still
-            equilibrating there -- its volume is 81k cells against a settled 99.5k)
+        time_indices: optional explicit array of time-snapshot indices to use, counted
+            AFTER the T_MAX cut; if None, every second snapshot is taken. Earlier
+            revisions also skipped index 0 because the drop was still equilibrating
+            there (81k cells against a settled 99.5k); in the current dataset it is
+            settled from the first snapshot (99717 cells against 99602 at the end), so
+            it is kept. All 27 snapshots are usable -- the stride of 2 is a cost choice,
+            not a correctness one.
 
     Returns:
-        (data, scales) where data is the dict of dataframes and scales carries the
-        measured L_ref / U_ref / T_ref plus the derived physical parameters, so that
-        the training script uses exactly the same nondimensionalisation. '''
+        (data, gauge, scales) where data is the dict of dataframes and scales carries the
+        measured L_ref / U_ref / T_ref, the nondimensional periodic lengths, and the derived
+        physical parameters, so that the training script uses exactly the same
+        nondimensionalisation. '''
 
     with h5py.File(h5_path, "r") as data:
         X = np.array(data["X"], dtype=float)
         Y = np.array(data["Y"], dtype=float)
         Z = np.array(data["Z"], dtype=float)
         times = np.array(data["time"], dtype=float)
-        levelset = -np.array(data["levelset"])
+        # DROP EVERYTHING PAST T_MAX. Sliced at read time so the discarded snapshots are
+        # never loaded and cannot leak into the measured scales.
+        assert np.all(np.diff(times) > 0), "h5 time axis is not increasing"
+        n_total = len(times)
+        n_keep = n_total if T_MAX is None else int(np.searchsorted(times, T_MAX, side="right"))
+        if n_keep == 0:
+            raise ValueError(
+                "T_MAX = %g discards every snapshot: %s stores t = %g .. %g. Raise T_MAX "
+                "above the first stored timestep, or set it to None to keep them all."
+                % (T_MAX, h5_path, times[0], times[-1]))
+        times = times[:n_keep]
+        levelset = -np.array(data["levelset"][:n_keep])
         # Only needed to measure the surface tension; fall back if the writer omits it.
-        pressure = np.array(data["pressure"], dtype=float) if "pressure" in data else None
+        pressure = np.array(data["pressure"][:n_keep], dtype=float) if "pressure" in data else None
+    print("Kept %d of %d snapshots (t = %g .. %g, T_MAX = %s)"
+          % (n_keep, n_total, times[0], times[-1], T_MAX))
 
     # UNDO THE PER-AXIS [0,1] NORMALISATION IN THE H5 WRITER.
     # Each axis is divided by its own stored spacing, putting all three back in cubic
@@ -393,7 +400,7 @@ def get_training_data_3d(NOP_A, NOP_PDE, NOP_xper, NOP_yper, NOP_zper, NOP_gauge
     cell_size = 1.0
 
     if time_indices is None:
-        time_indices = np.arange(1, len(times), 2)
+        time_indices = np.arange(0, len(times), 2)
     L_ref, U_ref, alpha_mean, SIGMA, sigma_spread = _measure_scales(levelset, pressure, times)
     T_ref = L_ref / U_ref
 
@@ -427,10 +434,7 @@ def get_training_data_3d(NOP_A, NOP_PDE, NOP_xper, NOP_yper, NOP_zper, NOP_gauge
     data_A = get_points_a_3d(NOP_A, times, X, Y, Z, cell_size, interface, normal, tangent1, tangent2, levelset)
     print("Generating points for PDE")
     data_PDE = get_points_pde_3d(NOP_PDE, times, X, Y, Z, cell_size, interface, normal, tangent1, tangent2, levelset)
-    print("Generating points for XPER/YPER/ZPER/GAUGE")
-    data_xper = get_x_periodic(NOP_xper, x_bounds, y_bounds, z_bounds, t_bounds)
-    data_yper = get_y_periodic(NOP_yper, x_bounds, y_bounds, z_bounds, t_bounds)
-    data_zper = get_z_periodic(NOP_zper, x_bounds, y_bounds, z_bounds, t_bounds)
+    print("Generating points for GAUGE")
     data_gauge = get_pressure_gauge(NOP_gauge, x_bounds, y_bounds, z_bounds, t_bounds)
 
     # NONDIMENSIONALIZE SPACE BY L_ref AND TIME BY T_ref (they differ here, unlike the
@@ -438,29 +442,16 @@ def get_training_data_3d(NOP_A, NOP_PDE, NOP_xper, NOP_yper, NOP_zper, NOP_gauge
     for arr in (data_A, data_PDE, data_gauge):
         arr[:, :3] /= L_ref
         arr[:, 3] /= T_ref
-    for arr in (data_xper, data_yper, data_zper):
-        arr[:, :6] /= L_ref
-        arr[:, 6] /= T_ref
 
-    # Extra PDE collocation points at the boundaries, mirroring the 2D pipeline's
-    # inclusion of the NSEW coordinates in data_PDE.
-    boundary_coords = np.vstack([
-        data_xper[:, [0, 1, 2, 6]], data_xper[:, [3, 4, 5, 6]],
-        data_yper[:, [0, 1, 2, 6]], data_yper[:, [3, 4, 5, 6]],
-        data_zper[:, [0, 1, 2, 6]], data_zper[:, [3, 4, 5, 6]],
-    ])
-    data_PDE = np.vstack([data_PDE, np.hstack([boundary_coords, np.zeros((len(boundary_coords), 1))])])
+    # PERIODIC LENGTHS. The period is the full cell count along each axis (N cells of
+    # size 1), not X[-1] - X[0], which is one cell short: cell centres 0.5 and N - 0.5
+    # are neighbours across the periodic seam, N - 1 cells apart in the interior.
+    period = [len(X) * dx / L_ref, len(Y) * dy / L_ref, len(Z) * dz / L_ref]
 
     print("Assembling data frames\n")
     frames = dict(
         A=pd.DataFrame(data=data_A, columns=["x_A", "y_A", "z_A", "t_A", "a_A"]),
         PDE=pd.DataFrame(data=data_PDE, columns=["x_PDE", "y_PDE", "z_PDE", "t_PDE", "f_PDE"]),
-        XPER=pd.DataFrame(data=data_xper,
-                          columns=["x_Xp", "y_Xp", "z_Xp", "x_Xm", "y_Xm", "z_Xm", "t_XPER"]),
-        YPER=pd.DataFrame(data=data_yper,
-                          columns=["x_Yp", "y_Yp", "z_Yp", "x_Ym", "y_Ym", "z_Ym", "t_YPER"]),
-        ZPER=pd.DataFrame(data=data_zper,
-                          columns=["x_Zp", "y_Zp", "z_Zp", "x_Zm", "y_Zm", "z_Zm", "t_ZPER"]),
     )
     gauge = pd.DataFrame(data=data_gauge, columns=["x_G", "y_G", "z_G", "t_G", "p_G"])
 
@@ -468,7 +459,7 @@ def get_training_data_3d(NOP_A, NOP_PDE, NOP_xper, NOP_yper, NOP_zper, NOP_gauge
     scales = dict(
         L_ref=L_ref, U_ref=U_ref, T_ref=T_ref, t_origin=float(t_origin),
         mu=[MU_DROP, MU_GAS], rho=[RHO_DROP, RHO_GAS], sigma=SIGMA, g=BODY_FORCE_Z,
-        alpha_mean=alpha_mean, rho_mean=rho_mean,
+        alpha_mean=alpha_mean, rho_mean=rho_mean, period=period,
     )
     rho_ref = RHO_GAS
     print("Volume-averaged drop fraction <a> = %.5f, rho_mean = %.5f (%.4f rho_ref)"
