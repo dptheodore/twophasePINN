@@ -429,10 +429,13 @@ def main():
                 losses = train_step(model, optimizer, physics, data_A, data_PDE, data_GAUGE)
                 epoch_losses.append([l.item() for l in losses])
 
-            mean_losses = torch.tensor(np.mean(epoch_losses, axis=0), dtype=torch.float64, device=device)
+            # Summed over batches (not averaged) to match rising_bubble_train.py. Each rank
+            # runs num_batches // world_size of the batches, so summing across ranks gives
+            # the same epoch total a single-process run would print.
+            sum_losses = torch.tensor(np.sum(epoch_losses, axis=0), dtype=torch.float64, device=device)
             if is_distributed:
-                dist.all_reduce(mean_losses, op=dist.ReduceOp.AVG)
-            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = mean_losses.tolist()
+                dist.all_reduce(sum_losses, op=dist.ReduceOp.SUM)
+            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_losses.tolist()
 
             history_loss_a.append(loss_a)
             history_loss_f_uvw.append(loss_u + loss_v + loss_w)
@@ -493,8 +496,9 @@ def main():
             batch_losses = compute_loss(underlying_net, physics, data_A, data_PDE, data_GAUGE)
             final_evaluation_losses.append([l.item() for l in batch_losses])
 
-        avg_final_losses = np.mean(final_evaluation_losses, axis=0)
-        _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = avg_final_losses
+        # Summed over batches to match rising_bubble_train.py.
+        sum_final_losses = np.sum(final_evaluation_losses, axis=0)
+        _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_final_losses
 
         logger.info("--- Final Loss Breakdown ---")
         logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")

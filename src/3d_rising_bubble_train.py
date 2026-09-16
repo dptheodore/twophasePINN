@@ -491,7 +491,7 @@ def main():
                 time_for_epoch = current_time - start_checkpoint_time
                 start_checkpoint_time = current_time
                 log_msg = f"Epoch: {epoch}/{epochs} - Time: {time_for_epoch:.2f}s - Loss: {total_loss:.4e}"
-                log_msg += f" | a: {loss_a:.4e}, gauge: {loss_gauge:.4e}, m: {loss_m:.4e}"
+                log_msg += f" | a: {loss_a:.4e}, BC: {loss_gauge:.4e}, m: {loss_m:.4e}"
                 log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, w: {loss_w:.4e}, pde_a: {loss_pde_a:.4e}"
                 logger.info(log_msg)
 
@@ -548,7 +548,7 @@ def main():
 
     logger.info("--- Final Loss Breakdown ---")
     logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")
-    logger.info(f"MSE_gauge (pressure)       : {loss_gauge:.4e}")
+    logger.info(f"MSE_BC                     : {loss_gauge:.4e}")
     logger.info(f"MSE_f,m                    : {loss_m:.4e}")
     logger.info(f"MSE_f,u                    : {loss_u:.4e}")
     logger.info(f"MSE_f,v                    : {loss_v:.4e}")
