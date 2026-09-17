@@ -30,7 +30,7 @@ torch.manual_seed(1234)
 
 Physics = namedtuple(
     "Physics",
-    ["mu1", "mu2", "sigma", "g", "rho1", "rho2", "U_ref", "L_ref", "rho_ref",
+    ["mu1", "mu2", "kappa", "g", "rho1", "rho2", "U_ref", "L_ref", "rho_ref",
      "loss_weights_PDE"],
 )
 
@@ -100,52 +100,100 @@ def compute_gradients(model, x, y, z, t):
     a_xx = torch.autograd.grad(a_x, x, torch.ones_like(a_x), create_graph=True)[0]
     a_yy = torch.autograd.grad(a_y, y, torch.ones_like(a_y), create_graph=True)[0]
     a_zz = torch.autograd.grad(a_z, z, torch.ones_like(a_z), create_graph=True)[0]
-    a_xy = torch.autograd.grad(a_x, y, torch.ones_like(a_x), create_graph=True)[0]
-    a_xz = torch.autograd.grad(a_x, z, torch.ones_like(a_x), create_graph=True)[0]
-    a_yz = torch.autograd.grad(a_y, z, torch.ones_like(a_y), create_graph=True)[0]
+
+    # THIRD derivatives of a, for the Korteweg force kappa*rho*grad(lap(rho)). The mixed
+    # second derivatives a_xy/a_xz/a_yz the sharp-interface curvature needed are gone with
+    # it -- grad(lap(a)) is all the free-energy model asks for.
+    lap_a = a_xx + a_yy + a_zz
+    lap_a_x = torch.autograd.grad(lap_a, x, torch.ones_like(lap_a), create_graph=True)[0]
+    lap_a_y = torch.autograd.grad(lap_a, y, torch.ones_like(lap_a), create_graph=True)[0]
+    lap_a_z = torch.autograd.grad(lap_a, z, torch.ones_like(lap_a), create_graph=True)[0]
+
+    # Velocity divergence and its gradient. Both are needed now that the flow is NOT
+    # incompressible: div(u) is a residual term in continuity, and its gradient appears in
+    # the compressible part of the viscous stress.
+    div_u = u_x + v_y + w_z
+    div_x = torch.autograd.grad(div_u, x, torch.ones_like(div_u), create_graph=True)[0]
+    div_y = torch.autograd.grad(div_u, y, torch.ones_like(div_u), create_graph=True)[0]
+    div_z = torch.autograd.grad(div_u, z, torch.ones_like(div_u), create_graph=True)[0]
 
     return (u, u_x, u_y, u_z, u_t, u_xx, u_yy, u_zz), \
            (v, v_x, v_y, v_z, v_t, v_xx, v_yy, v_zz), \
            (w, w_x, w_y, w_z, w_t, w_xx, w_yy, w_zz), \
            (p, p_x, p_y, p_z), \
-           (a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz, a_xy, a_xz, a_yz)
+           (a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz), \
+           (lap_a_x, lap_a_y, lap_a_z, div_u, div_x, div_y, div_z)
 
 
 def PDE_caller(model, physics, x, y, z, t):
-    u_grads, v_grads, w_grads, p_grads, a_grads = compute_gradients(model, x, y, z, t)
+    """Residuals of the equations LBPM actually integrates.
+
+    The dataset comes from eos_type = "cp": a SINGLE-COMPONENT Peng-Robinson free-energy
+    model (see the repo-root t14_forced_sphere.db). Three consequences, all of which the
+    earlier sharp-interface incompressible form got wrong:
+
+    1. Both phases are the same substance, so the interface exchanges mass by evaporation
+       and condensation instead of being advected as a material surface. Continuity is
+       d(rho)/dt + div(rho u) = 0, and there is no separate a_t + u.grad(a) = 0 equation --
+       it was forcing the interface to move with the fluid, which it does not. Measured on
+       this data div(u) is 1.29x the size of its own terms, so the incompressible form
+       could never have driven its residual to zero honestly.
+    2. Surface tension is not a sharp-interface sigma*curvature force; it is the Korteweg
+       (density-gradient) force kappa*rho*grad(lap(rho)), with kappa = Color/pr_kappa taken
+       straight from the .db. No sigma calibration is involved -- which is just as well,
+       since measuring sigma from this data is ambiguous by a factor of ~30 depending on
+       which cells are averaged.
+    3. With div(u) != 0 the viscous stress carries its compressible part, -(2/3)*mu*div(u)
+       on the diagonal (Stokes' hypothesis; LBPM's MRT bulk viscosity is not exactly this,
+       so it is an approximation, but a far smaller one than omitting the term).
+
+    p is the network's own field and is now interpretable as the thermodynamic pressure,
+    since the Korteweg force carries the interfacial stress that the CSF term used to.
+    """
+    u_grads, v_grads, w_grads, p_grads, a_grads, extra = compute_gradients(model, x, y, z, t)
     u, u_x, u_y, u_z, u_t, u_xx, u_yy, u_zz = u_grads
     v, v_x, v_y, v_z, v_t, v_xx, v_yy, v_zz = v_grads
     w, w_x, w_y, w_z, w_t, w_xx, w_yy, w_zz = w_grads
     p, p_x, p_y, p_z = p_grads
-    a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz, a_xy, a_xz, a_yz = a_grads
+    a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz = a_grads
+    lap_a_x, lap_a_y, lap_a_z, div_u, div_x, div_y, div_z = extra
 
     mu = physics.mu2 + (physics.mu1 - physics.mu2) * a
     mu_x = (physics.mu1 - physics.mu2) * a_x
     mu_y = (physics.mu1 - physics.mu2) * a_y
     mu_z = (physics.mu1 - physics.mu2) * a_z
     rho = physics.rho2 + (physics.rho1 - physics.rho2) * a
-
-    abs_interface_grad = torch.sqrt(a_x ** 2 + a_y ** 2 + a_z ** 2 + np.finfo(float).eps)
-    # 3D mean curvature of the levelset -div(grad(a)/|grad(a)|)
-    curvature = -(((a_yy + a_zz) * a_x ** 2 + (a_xx + a_zz) * a_y ** 2 + (a_xx + a_yy) * a_z ** 2
-                   - 2 * a_x * a_y * a_xy - 2 * a_x * a_z * a_xz - 2 * a_y * a_z * a_yz)
-                  / torch.pow(abs_interface_grad, 3))
+    # Nondimensional density and its slope w.r.t. a: rho* = 1 + drho_da * a.
+    rho_star = rho / physics.rho_ref
+    drho_da = (physics.rho1 - physics.rho2) / physics.rho_ref
 
     one_Re = mu / (physics.rho_ref * physics.U_ref * physics.L_ref)
     one_Re_x = mu_x / (physics.rho_ref * physics.U_ref * physics.L_ref)
     one_Re_y = mu_y / (physics.rho_ref * physics.U_ref * physics.L_ref)
     one_Re_z = mu_z / (physics.rho_ref * physics.U_ref * physics.L_ref)
-    one_We = physics.sigma / (physics.rho_ref * physics.U_ref ** 2 * physics.L_ref)
+    # Korteweg coefficient: kappa*rho_ref / (L_ref^2 * U_ref^2) makes kappa*rho*grad(lap(rho))
+    # dimensionless on the same rho_ref*U_ref^2/L_ref scale as every other momentum term.
+    Ko = physics.kappa * physics.rho_ref / (physics.L_ref ** 2 * physics.U_ref ** 2)
     one_Fr = physics.g * physics.L_ref / physics.U_ref ** 2
 
-    PDE_m = u_x + v_y + w_z
-    PDE_a = a_t + u * a_x + v * a_y + w * a_z
-    PDE_u = (u_t + u * u_x + v * u_y + w * u_z) * rho / physics.rho_ref + p_x - \
-            one_We * curvature * a_x - one_Re * (u_xx + u_yy + u_zz) - \
-            2.0 * one_Re_x * u_x - one_Re_y * (u_y + v_x) - one_Re_z * (u_z + w_x)
-    PDE_v = (v_t + u * v_x + v * v_y + w * v_z) * rho / physics.rho_ref + p_y - \
-            one_We * curvature * a_y - one_Re * (v_xx + v_yy + v_zz) - \
-            2.0 * one_Re_y * v_y - one_Re_x * (u_y + v_x) - one_Re_z * (v_z + w_y)
+    # CONTINUITY with mass exchange across the interface. Expanding
+    # d(rho*)/dt + div(rho* u) with rho* = 1 + drho_da * a gives the advective part of a
+    # (which is NOT zero here) plus the compressible part.
+    PDE_m = drho_da * (a_t + u * a_x + v * a_y + w * a_z) + rho_star * div_u
+
+    # Korteweg force per unit volume, grad(lap(rho*)) = drho_da * grad(lap(a)).
+    F_ko_x = Ko * rho_star * drho_da * lap_a_x
+    F_ko_y = Ko * rho_star * drho_da * lap_a_y
+    F_ko_z = Ko * rho_star * drho_da * lap_a_z
+
+    PDE_u = (u_t + u * u_x + v * u_y + w * u_z) * rho_star + p_x - \
+            F_ko_x - one_Re * (u_xx + u_yy + u_zz) - \
+            2.0 * one_Re_x * u_x - one_Re_y * (u_y + v_x) - one_Re_z * (u_z + w_x) + \
+            (2.0 / 3.0) * (one_Re * div_x + one_Re_x * div_u)
+    PDE_v = (v_t + u * v_x + v * v_y + w * v_z) * rho_star + p_y - \
+            F_ko_y - one_Re * (v_xx + v_yy + v_zz) - \
+            2.0 * one_Re_y * v_y - one_Re_x * (u_y + v_x) - one_Re_z * (v_z + w_y) + \
+            (2.0 / 3.0) * (one_Re * div_y + one_Re_y * div_u)
     # Gravity acts along z, so the body-force term lives in the w-momentum equation.
     #
     # FULL GRAVITY, exactly as the 2D script does it.
@@ -167,12 +215,13 @@ def PDE_caller(model, physics, x, y, z, t):
     # <rho/rho_ref * w_t> balances <rho/rho_ref> * (1/Fr) while <p_z> = 0. Subtracting
     # rho_mean would instead demand a mean acceleration of zero, which the data
     # contradicts directly.
-    PDE_w = (w_t + u * w_x + v * w_y + w * w_z) * rho / physics.rho_ref + p_z - \
-            one_We * curvature * a_z - one_Re * (w_xx + w_yy + w_zz) - \
-            rho / physics.rho_ref * one_Fr - 2.0 * one_Re_z * w_z - \
-            one_Re_x * (u_z + w_x) - one_Re_y * (v_z + w_y)
+    PDE_w = (w_t + u * w_x + v * w_y + w * w_z) * rho_star + p_z - \
+            F_ko_z - one_Re * (w_xx + w_yy + w_zz) - \
+            rho_star * one_Fr - 2.0 * one_Re_z * w_z - \
+            one_Re_x * (u_z + w_x) - one_Re_y * (v_z + w_y) + \
+            (2.0 / 3.0) * (one_Re * div_z + one_Re_z * div_u)
 
-    return PDE_m, PDE_u, PDE_v, PDE_w, PDE_a
+    return PDE_m, PDE_u, PDE_v, PDE_w
 
 
 def compute_loss(model, physics, data_A, data_PDE, data_GAUGE):
@@ -201,21 +250,22 @@ def compute_loss(model, physics, data_A, data_PDE, data_GAUGE):
     loss_BC = loss_p_GAUGE
 
     # Loss PDE (Physics-Informed)
-    PDE_m, PDE_u, PDE_v, PDE_w, PDE_a = PDE_caller(model, physics, x_PDE, y_PDE, z_PDE, t_PDE)
+    # Four residuals now, not five: continuity absorbs what used to be the separate
+    # volume-fraction advection equation (see PDE_caller).
+    PDE_m, PDE_u, PDE_v, PDE_w = PDE_caller(model, physics, x_PDE, y_PDE, z_PDE, t_PDE)
     loss_PDE_m = torch.mean((f_PDE - PDE_m) ** 2)
     loss_PDE_u = torch.mean((f_PDE - PDE_u) ** 2)
     loss_PDE_v = torch.mean((f_PDE - PDE_v) ** 2)
     loss_PDE_w = torch.mean((f_PDE - PDE_w) ** 2)
-    loss_PDE_a = torch.mean((f_PDE - PDE_a) ** 2)
 
     loss_PDE = torch.dot(
-        torch.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a]),
+        torch.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w]),
         physics.loss_weights_PDE,
     )
 
     total_loss = loss_a_A + loss_BC + loss_PDE
 
-    return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a
+    return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w
 
 
 def train_step(model, optimizer, physics, data_A, data_PDE, data_GAUGE):
@@ -367,17 +417,20 @@ def main():
     # values, which were SI quantities for a light bubble in water and had no
     # correspondence to this lattice-unit run of a dense drop in gas.
     mu = scales["mu"]            # [drop, carrier] dynamic viscosity = rho * nu
-    sigma = scales["sigma"]      # measured by Laplace's law (emergent from the PR EOS)
+    kappa = scales["kappa"]      # Color/pr_kappa: the Korteweg coefficient, straight from the .db
     g = scales["g"]              # Color/F = 0,0,+2e-6, per unit mass, along +z
     rho = scales["rho"]          # [rhoA drop, rhoB carrier]
     u_ref = scales["U_ref"]
     L_ref = scales["L_ref"]
     logger.info(f"Reference scales: L_ref={L_ref:.4f} cells, U_ref={u_ref:.6g} cells/step, "
                 f"T_ref={scales['T_ref']:.1f} steps")
-    logger.info(f"mu={mu}, rho={rho}, sigma={sigma}, g={g}, rho_mean={scales['rho_mean']:.5f}")
-    loss_weights_PDE = [1.0, 10.0, 10.0, 10.0, 1.0]
+    logger.info(f"mu={mu}, rho={rho}, kappa={kappa}, g={g}, rho_mean={scales['rho_mean']:.5f}")
+    logger.info(f"Ko = {kappa * rho[1] / (L_ref ** 2 * u_ref ** 2):.4f} "
+                f"(measured sigma {scales['sigma']:.4g} is diagnostic only now)")
+    # [continuity, u, v, w] -- the volume-fraction advection residual is gone.
+    loss_weights_PDE = [1.0, 10.0, 10.0, 10.0]
     physics = Physics(
-        mu1=mu[0], mu2=mu[1], sigma=sigma, g=g, rho1=rho[0], rho2=rho[1],
+        mu1=mu[0], mu2=mu[1], kappa=kappa, g=g, rho1=rho[0], rho2=rho[1],
         U_ref=u_ref, L_ref=L_ref, rho_ref=rho[1],
         loss_weights_PDE=torch.tensor(loss_weights_PDE, dtype=torch.float32, device=device),
     )
@@ -397,7 +450,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rates[0], eps=1e-8)
 
     start_total = time.time()
-    history_loss_a, history_loss_f_uvw, history_loss_f_ma = [], [], []
+    history_loss_a, history_loss_f_uvw, history_loss_f_m = [], [], []
     current_best_total_loss = float('inf')
 
     num_batches, prop_batch_sizes = None, None
@@ -435,11 +488,11 @@ def main():
             sum_losses = torch.tensor(np.sum(epoch_losses, axis=0), dtype=torch.float64, device=device)
             if is_distributed:
                 dist.all_reduce(sum_losses, op=dist.ReduceOp.SUM)
-            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_losses.tolist()
+            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w = sum_losses.tolist()
 
             history_loss_a.append(loss_a)
             history_loss_f_uvw.append(loss_u + loss_v + loss_w)
-            history_loss_f_ma.append(loss_m + loss_pde_a)
+            history_loss_f_m.append(loss_m)
 
             if epoch % checkpoint_interval == 0:
                 current_time = time.time()
@@ -447,7 +500,7 @@ def main():
                 start_checkpoint_time = current_time
                 log_msg = f"Epoch: {epoch}/{epochs} - Time: {time_for_epoch:.2f}s - Loss: {total_loss:.4e}"
                 log_msg += f" | a: {loss_a:.4e}, BC: {loss_bc:.4e}, m: {loss_m:.4e}"
-                log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, w: {loss_w:.4e}, pde_a: {loss_pde_a:.4e}"
+                log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, w: {loss_w:.4e}"
                 logger.info(log_msg)
 
             if is_main and epoch % checkpoint_interval == 0 and total_loss < current_best_total_loss:
@@ -498,16 +551,15 @@ def main():
 
         # Summed over batches to match rising_bubble_train.py.
         sum_final_losses = np.sum(final_evaluation_losses, axis=0)
-        _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_final_losses
+        _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w = sum_final_losses
 
         logger.info("--- Final Loss Breakdown ---")
         logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")
         logger.info(f"MSE_BC                     : {loss_bc:.4e}")
-        logger.info(f"MSE_f,m                    : {loss_m:.4e}")
+        logger.info(f"MSE_f,m (continuity)       : {loss_m:.4e}")
         logger.info(f"MSE_f,u                    : {loss_u:.4e}")
         logger.info(f"MSE_f,v                    : {loss_v:.4e}")
         logger.info(f"MSE_f,w                    : {loss_w:.4e}")
-        logger.info(f"MSE_f,a                    : {loss_pde_a:.4e}")
         logger.info("----------------------------\n")
 
         logger.info("Generating and saving loss history plots...")
@@ -533,13 +585,13 @@ def main():
         plt.savefig(os.path.join(dirname, 'loss_history_momentum_uvw.png'))
 
         plt.figure(figsize=(10, 6))
-        plt.plot(epochs_range, history_loss_f_ma)
-        plt.title(f'MSE of Conservation (m,a) vs. Epochs ({adaptive_mode} - {activation_choice})')
+        plt.plot(epochs_range, history_loss_f_m)
+        plt.title(f'MSE of Continuity vs. Epochs ({adaptive_mode} - {activation_choice})')
         plt.xlabel('Epoch')
-        plt.ylabel('MSE Loss (f_m + f_a)')
+        plt.ylabel('MSE Loss (f_m)')
         plt.yscale('log')
         plt.grid(True, which="both", ls="--")
-        plt.savefig(os.path.join(dirname, 'loss_history_conservation_ma.png'))
+        plt.savefig(os.path.join(dirname, 'loss_history_continuity.png'))
 
         plt.close('all')
         logger.info("Plots saved successfully.")
@@ -550,7 +602,7 @@ def main():
             'epoch': epochs_range,
             'MSE_alpha': history_loss_a,
             'MSE_f_uvw': history_loss_f_uvw,
-            'MSE_f_ma': history_loss_f_ma,
+            'MSE_f_m': history_loss_f_m,
         })
         history_df.to_csv(history_filepath, index=False)
         logger.info(f"Loss history data saved to: {history_filepath}")

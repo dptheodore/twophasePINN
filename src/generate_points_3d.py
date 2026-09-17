@@ -67,17 +67,27 @@ the densities, viscosity and body force, which cannot be recovered from the h5
 and must be synced with the .db by hand. '''
 
 
-# Physical parameters of the LBPM run. THESE MUST BE KEPT IN SYNC WITH
-# t14_forced_sphere.db BY HAND -- unlike L_ref/U_ref/sigma below, they cannot be
+# Physical parameters of the LBPM run. THESE MUST BE KEPT IN SYNC BY HAND with the
+# source-of-truth config, twophasePINN/t14_forced_sphere.db (the repo root, NOT the
+# stale copy in the home directory) -- unlike L_ref/U_ref/sigma below, they cannot be
 # recovered from the h5 output, so changing the .db without changing them here
 # silently trains against the wrong physics.
 # rho1/mu1 are the a=1 (drop) phase, rho2/mu2 the a=0 (carrier) phase.
 RHO_DROP = 5.9082346452      # Color/rhoA  (Peng-Robinson coexistence density at T_Tc=0.9)
 RHO_GAS = 0.5799723133       # Color/rhoB
-NU = 0.047                   # Chemicalpotential/niu_1 = niu_2 = (tauA-0.5)/3, tauA=0.641
-MU_DROP = RHO_DROP * NU      # 0.277687
-MU_GAS = RHO_GAS * NU        # 0.027259
-BODY_FORCE_Z = 2e-6          # Color/F = 0,0,2e-6, applied per unit mass, along +Z
+NU = 0.1666666667            # Chemicalpotential/niu_1 = niu_2 = (tauA-0.5)/3, tauA = tauB = 1.0
+MU_DROP = RHO_DROP * NU      # 0.984706
+MU_GAS = RHO_GAS * NU        # 0.096662
+# The .db carries Color/F = 0,0,0 and body_force_z = 0: the acceleration comes from a
+# flux increment of 2e-6 added in the chemical-potential model, which is what makes the
+# domain gently accelerate along +Z over the run (measured bulk accel 1.97e-6 per step).
+BODY_FORCE_Z = 2e-6
+# Color/pr_kappa. In the Peng-Robinson free-energy model this is the density-gradient
+# (Korteweg) coefficient, and it is what actually produces surface tension in the run.
+# The momentum equation uses it directly -- kappa*rho*grad(lap(rho)) -- instead of a
+# sharp-interface sigma*curvature term, so no sigma calibration enters training. SIGMA
+# below is kept only as a diagnostic.
+PR_KAPPA = 0.02
 # Fallback surface tension, used only if it cannot be measured from the data.
 # Surface tension is emergent from the Peng-Robinson chemical-potential model
 # (set by pr_kappa and T_Tc) rather than given in the .db, so _measure_sigma
@@ -459,13 +469,15 @@ def get_training_data_3d(NOP_A, NOP_PDE, NOP_gauge=40,
     scales = dict(
         L_ref=L_ref, U_ref=U_ref, T_ref=T_ref, t_origin=float(t_origin),
         mu=[MU_DROP, MU_GAS], rho=[RHO_DROP, RHO_GAS], sigma=SIGMA, g=BODY_FORCE_Z,
-        alpha_mean=alpha_mean, rho_mean=rho_mean, period=period,
+        alpha_mean=alpha_mean, rho_mean=rho_mean, period=period, kappa=PR_KAPPA,
     )
     rho_ref = RHO_GAS
     print("Volume-averaged drop fraction <a> = %.5f, rho_mean = %.5f (%.4f rho_ref)"
           % (alpha_mean, rho_mean, rho_mean / rho_ref))
-    print("Nondimensional groups: 1/Re(carrier) = %.4f, 1/Re(drop) = %.4f, 1/We = %.4f, 1/Fr = %.4f"
+    print("Nondimensional groups: 1/Re(carrier) = %.4f, 1/Re(drop) = %.4f, Ko = %.4f, 1/Fr = %.4f"
           % (MU_GAS / (rho_ref * U_ref * L_ref), MU_DROP / (rho_ref * U_ref * L_ref),
-             SIGMA / (rho_ref * U_ref ** 2 * L_ref), BODY_FORCE_Z * L_ref / U_ref ** 2))
+             PR_KAPPA * rho_ref / (L_ref ** 2 * U_ref ** 2), BODY_FORCE_Z * L_ref / U_ref ** 2))
+    print("  (Ko is the Korteweg coefficient now used in the momentum equation; the measured"
+          " sigma gives 1/We = %.4f, diagnostic only)" % (SIGMA / (rho_ref * U_ref ** 2 * L_ref)))
 
     return frames, gauge, scales
