@@ -14,3 +14,4 @@ pyrightconfig.json
 *.h5
 *.log
 *.sh
+.aider*
