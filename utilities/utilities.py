@@ -182,9 +182,22 @@ class NNCreator:
     def __init__(self, dtype):
         self.dtype = dtype
 
-    def get_model_dnn(self, input_dim, hidden_layers, output_layer, activation_functions_dict, use_ad_act):
+    def get_model_dnn(self, input_dim, hidden_layers, output_layer, activation_functions_dict, use_ad_act,
+                      periodic_lengths=None):
+            ''' periodic_lengths: optional list of periods for the leading spatial inputs. Each
+            such coordinate c is replaced by (sin(2 pi c / L), cos(2 pi c / L)) before the first
+            Dense layer, making every output and all its derivatives exactly L-periodic in c.
+            The remaining inputs (e.g. t) pass through unchanged. The model still takes
+            input_dim raw coordinates; only the first Dense layer's fan-in grows. '''
             input_tensor = tf.keras.layers.Input(shape=(input_dim,), name="input_tensor", dtype=self.dtype)
             x = input_tensor
+            if periodic_lengths is not None:
+                n_per = len(periodic_lengths)
+                omega = tf.constant([2.0 * np.pi / L for L in periodic_lengths], dtype=self.dtype)
+                x = tf.keras.layers.Lambda(
+                    lambda c: tf.concat([tf.sin(c[:, :n_per] * omega), tf.cos(c[:, :n_per] * omega),
+                                         c[:, n_per:]], axis=1),
+                    name="periodic_embedding")(x)
             for i, nodes in enumerate(hidden_layers):
                 x = tf.keras.layers.Dense(nodes, activation=self.get_activation_function(activation_functions_dict[i+1], use_ad_act), kernel_initializer=tf.keras.initializers.glorot_normal())(x)
             outputs = []

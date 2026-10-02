@@ -240,24 +240,33 @@ class NNCreator:
     def __init__(self, dtype=torch.float32):
         self.dtype = dtype
     
-    def get_model_dnn(self, input_dim, hidden_layers, output_layer, 
-                     activation_functions_dict, use_ad_act):
+    def get_model_dnn(self, input_dim, hidden_layers, output_layer,
+                     activation_functions_dict, use_ad_act, periodic_lengths=None):
         """
         Build a DNN model
-        
+
         Args:
             input_dim: dimension of input (e.g., 3 for x, y, t)
             hidden_layers: list of hidden layer sizes
             output_layer: list of tuples (output_name, activation)
             activation_functions_dict: dict mapping layer index to [func_name, coeff, n]
             use_ad_act: whether to use adaptive activation
-        
+            periodic_lengths: optional list of periods for the LEADING spatial inputs.
+                Each such coordinate c is replaced by (sin(2 pi c / L), cos(2 pi c / L))
+                before the first layer, making every output and all its derivatives
+                exactly L-periodic in c. Remaining inputs (e.g. t) pass through
+                unchanged. The model still takes input_dim raw coordinates; only the
+                first layer's fan-in grows, by one per periodic coordinate.
+                Mirrors utilities.NNCreator.get_model_dnn on the TensorFlow side.
+
         Returns:
             PyTorch nn.Module
         """
         layers = []
         in_features = input_dim
-        
+        if periodic_lengths is not None:
+            in_features = input_dim + len(periodic_lengths)
+
         # Build hidden layers
         for i, nodes in enumerate(hidden_layers):
             layer_idx = i + 1
@@ -278,9 +287,16 @@ class NNCreator:
         
         # Build the model
         class DNN(nn.Module):
-            def __init__(self, hidden_layers_list, output_specs, in_features):
+            def __init__(self, hidden_layers_list, output_specs, in_features, periods):
                 super().__init__()
                 self.hidden_layers = nn.ModuleList(hidden_layers_list)
+                self.n_periodic = 0 if periods is None else len(periods)
+                if self.n_periodic:
+                    # Registered as a buffer so it follows the model across .to(device)
+                    # and is saved with the state dict.
+                    self.register_buffer("omega", torch.tensor(
+                        [2.0 * np.pi / L for L in periods],
+                        dtype=torch.get_default_dtype()))
                 
                 # Create output layers
                 self.output_layers = nn.ModuleDict()
@@ -293,6 +309,15 @@ class NNCreator:
                 self.output_specs = output_specs
             
             def forward(self, x):
+                # PERIODIC EMBEDDING. Replace the leading spatial coordinates by the
+                # sin/cos of their phase, so the network and all of its derivatives are
+                # exactly periodic in those coordinates. Trailing inputs (t) pass
+                # through untouched.
+                if self.n_periodic:
+                    n = self.n_periodic
+                    phase = x[:, :n] * self.omega
+                    x = torch.cat([torch.sin(phase), torch.cos(phase), x[:, n:]], dim=1)
+
                 # Pass through hidden layers
                 for layer in self.hidden_layers:
                     x = layer(x)
@@ -317,7 +342,7 @@ class NNCreator:
                 
                 return tuple(outputs) if len(outputs) > 1 else outputs[0]
         
-        model = DNN(layers, output_layer, in_features)
+        model = DNN(layers, output_layer, in_features, periodic_lengths)
         return model
     
     def get_activation_function(self, name_coeff_n, use_ad_act):
