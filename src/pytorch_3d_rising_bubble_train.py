@@ -4,6 +4,7 @@ import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
 import math
+import contextlib
 import time
 import glob
 import shutil
@@ -20,11 +21,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from generate_points_3d import get_training_data_3d
 from pytorch_utilities import NNCreator, writeToJSONFile
 
-# Set random seeds for reproducibility. Each rank ends up with its own
-# independently-sampled collocation points (see get_training_data_3d), which is
-# fine for data-parallel training -- only the per-rank dataset SIZES need to
-# match across ranks, not their contents, and those sizes are deterministic
-# given the NOP_* point counts below.
+# Every rank seeds identically and so generates the SAME training points. The data is
+# then partitioned at batch level (rank r trains batches r, r + N, r + 2N, ... of a
+# shuffle shared by all ranks), so each epoch visits every batch exactly once whatever the
+# number of GPUs.
 np.random.seed(1234)
 torch.manual_seed(1234)
 
@@ -373,11 +373,15 @@ def main():
         logger = get_logger(None, name=f"{__name__}.rank{rank}", console=True)
 
     logger.info(f"[rank {rank}/{world_size}] using device {device}")
+    if not is_main:
+        logger.setLevel(logging.WARNING)  # rank 0 reports the all-reduced losses for everyone
 
     NOP_a = (500, 400)
     NOP_PDE = (400, 2000, 3000)
 
-    training_data, gauge_df, scales = get_training_data_3d(NOP_a, NOP_PDE)
+    # Generation prints only from rank 0; the rest generate silently.
+    with contextlib.redirect_stdout(sys.stdout if is_main else open(os.devnull, "w")):
+        training_data, gauge_df, scales = get_training_data_3d(NOP_a, NOP_PDE)
 
     # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
@@ -442,7 +446,11 @@ def main():
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
     checkpoint_interval = 10
-    num_of_batches = 20
+    # Batches per epoch across ALL ranks, rounded up to a multiple of world_size so every
+    # rank takes the same number of steps (unequal counts deadlock DDP's all-reduce). The
+    # per-GPU batch therefore stays ~1/20 of the data; the effective batch per optimizer
+    # step is world_size times that.
+    num_of_batches = math.ceil(20 / world_size) * world_size
 
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches)
@@ -462,22 +470,23 @@ def main():
             group['lr'] = lr
 
         prop_batch_sizes, num_batches = get_proportional_batch_sizes(total_batch_size, training_data, logger)
-        # Each rank owns a full independent copy of training_data (see module
-        # docstring note on seeding); splitting num_batches across ranks keeps
-        # every rank's per-epoch step count identical, which DDP's collective
-        # all-reduce during backward() requires to stay in lockstep.
-        num_local_batches = max(1, num_batches // world_size)
+        # Equal step counts on every rank, or DDP's all-reduce deadlocks.
+        num_local_batches = num_batches // world_size
+        if num_batches % world_size:
+            logger.info(f"Dropping {num_batches % world_size} remainder batch(es) per epoch "
+                        f"to keep {world_size} ranks in lockstep")
         start_checkpoint_time = time.time()
 
         for epoch in range(1, epochs + 1):
             epoch_losses = []
-            shuffled_data = {key: df.sample(frac=1).reset_index(drop=True) for key, df in training_data.items()}
+            # Same permutation on every rank (seeded by phase and epoch), different batches.
+            rng = np.random.default_rng([1234, i, epoch])
+            shuffled_data = {key: df.sample(frac=1, random_state=rng).reset_index(drop=True)
+                             for key, df in training_data.items()}
 
-            for b in range(num_local_batches):
-                batch_dict = slice_batch(shuffled_data, prop_batch_sizes, b)
-                if all(batch.empty for batch in batch_dict.values()):
-                    continue
-
+            # No skipping of empty batches here: a rank that skips a step deadlocks the rest.
+            for k in range(num_local_batches):
+                batch_dict = slice_batch(shuffled_data, prop_batch_sizes, rank + k * world_size)
                 data_A, data_PDE = build_batch_tensors(batch_dict, device)
                 losses = train_step(model, optimizer, physics, data_A, data_PDE, data_GAUGE)
                 epoch_losses.append([l.item() for l in losses])
