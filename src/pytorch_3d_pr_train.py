@@ -33,10 +33,13 @@ bulk densities are not pinned at the .db's rhoA/rhoB (the data runs 0.45 .. 5.95
 Residuals, all nondimensional (see generate_points_3d_pr for the derivation from LBPM):
 
   continuity  rho_t + u . grad(rho) + rho div(u) = 0
-  momentum    rho Du/Dt = -Eu grad(p) + Ko rho grad(lap(rho)) + div(tau) + rho g(t)/Fr
+  momentum    rho Du/Dt = -Eu grad(p) + (Ko rho + Kb) grad(lap(rho)) + div(tau) + rho g(t)/Fr
   EOS         p = P_PR(rho) / p_scale
 
-Eu = k^2 p_scale / (rho_ref U_ref^2) carries LBPM's k-transformation factor. The EOS
+Eu = k^2 p_scale / (rho_ref U_ref^2) carries LBPM's k-transformation factor. Kb =
+LATTICE_BETA / (L_ref U_ref)^2 is the rho-independent Korteweg-like term the CFD obeys on
+top of kappa (see generate_points_3d_pr); without it the CFD's own rho profile is not a
+solution and the network trades rho accuracy for momentum loss. The EOS
 residual holds p to the thermodynamic pressure, which also fixes its gauge -- no pressure
 gauge point is needed any more. a takes no part in the physics: it is a supervised phase
 indicator kept for interface tracking and post-processing.
@@ -71,7 +74,7 @@ SUPERVISED = ("rho", "u", "v", "w") if GRAVITY_MODE == "learned" else ("rho",)
 
 Physics = namedtuple(
     "Physics",
-    ["one_Re", "Eu", "Ko", "U_ref", "L_ref", "rho_ref", "p_scale",
+    ["one_Re", "Eu", "Ko", "Kb", "U_ref", "L_ref", "rho_ref", "p_scale",
      "drho_star", "loss_weights_PDE", "loss_weight_EOS", "loss_weights_DATA"],
 )
 
@@ -169,7 +172,7 @@ def PDE_caller(model, physics, x, y, z, t):
         visc = rho * (lap_vel[i] + (1.0 + lam) * ddiv[i]) + \
             sum(drho[j] * (dvel[i][j] + dvel[j][i]) for j in range(3)) + \
             lam * drho[i] * div_u
-        res = rho * accel + physics.Eu * dp[i] - physics.Ko * rho * dlap_rho[i] - \
+        res = rho * accel + physics.Eu * dp[i] - (physics.Ko * rho + physics.Kb) * dlap_rho[i] - \
             physics.one_Re * visc
         if i == 2:
             res = res - rho * gz
@@ -386,8 +389,9 @@ def main():
     one_Re = pr.NU / (U_ref * L_ref)
     Eu = pr.K_FACTOR ** 2 * p_scale / (rho_ref * U_ref ** 2)
     Ko = pr.PR_KAPPA * rho_ref / (L_ref ** 2 * U_ref ** 2)
+    Kb = pr.LATTICE_BETA / (L_ref ** 2 * U_ref ** 2)
     logger.info(f"L_ref={L_ref:.4f} cells, U_ref={U_ref:.6g} cells/step, T_ref={scales['T_ref']:.1f} steps")
-    logger.info(f"1/Re={one_Re:.4f}, Eu={Eu:.4f}, Ko={Ko:.4f}, "
+    logger.info(f"1/Re={one_Re:.4f}, Eu={Eu:.4f}, Ko={Ko:.4f}, Kb={Kb:.4f}, "
                 f"1/Fr(g=2e-6)={pr.FORCE_INCREMENT * L_ref / U_ref ** 2:.4f}")
 
     # [continuity, u, v, w] -- same weighting as the 3D script. Interface residuals are
@@ -397,7 +401,7 @@ def main():
     loss_weight_EOS = 1.0
     loss_weights_DATA = [1.0] * len(SUPERVISED)
     physics = Physics(
-        one_Re=one_Re, Eu=Eu, Ko=Ko, U_ref=U_ref, L_ref=L_ref, rho_ref=rho_ref, p_scale=p_scale,
+        one_Re=one_Re, Eu=Eu, Ko=Ko, Kb=Kb, U_ref=U_ref, L_ref=L_ref, rho_ref=rho_ref, p_scale=p_scale,
         drho_star=(pr.RHO_LIQ - pr.RHO_GAS) / rho_ref,
         loss_weights_PDE=torch.tensor(loss_weights_PDE, dtype=torch.float32, device=device),
         loss_weight_EOS=loss_weight_EOS,
@@ -409,9 +413,10 @@ def main():
     checkpoint_interval = 10
     # Batches per epoch across ALL ranks, rounded up to a multiple of world_size so every
     # rank takes the same number of steps (unequal counts deadlock DDP's all-reduce). The
-    # per-GPU batch therefore stays ~1/20 of the data; the effective batch per optimizer
-    # step is world_size times that.
-    num_of_batches = math.ceil(20 / world_size) * world_size
+    # per-GPU batch therefore stays ~1/40 of the data; the effective batch per optimizer
+    # step is world_size times that. 40 (was 20) keeps the batch the same size since the
+    # generator went from every second snapshot to all 27.
+    num_of_batches = math.ceil(40 / world_size) * world_size
 
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches)

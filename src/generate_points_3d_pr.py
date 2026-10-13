@@ -18,14 +18,21 @@ What the LBPM cp model integrates (LBPM-UNC-4, cuda/LIBB.cu, all in lattice unit
 The +(1/3) grad(rho) cancels the LBM's own ideal-gas pressure, and Gibbs-Duhem
 (rho grad(mu_PR) = grad(P_PR)) turns the rest into
 
-    rho Du/Dt = -k^2 grad(P_PR(rho)) + kappa rho grad(lap(rho)) + rho g + div(tau)
+    rho Du/Dt = -k^2 grad(P_PR(rho)) + (kappa rho + beta) grad(lap(rho)) + rho g + div(tau)
 
-Two consequences checked against this dataset:
+beta (LATTICE_BETA) is not in the continuum model above; it is measured from the data.
+Checked against lbpm_bubble_dataset_newrun_nowrap.h5 (diagnose_rho_residuals.py):
   - The h5 pressure IS P_PR(density) to 2e-8, so p is not independent of rho. The
     training script keeps p as an output but ties it to rho through an EOS residual.
-  - The k^2 = 0.25 factor is real: with it, -k^2 grad(P_PR) and the Korteweg term balance
-    across the interface to within 15% of either term; with k^2 = 1 the residual is 6x
-    larger.
+  - At the interface the CFD satisfies k^2 grad(P_PR) = (kappa rho + beta) grad(lap(rho))
+    with beta = 0.085 ~= 1/12 (lattice units) to 2%; without beta the two sides differ by
+    2.3x and the trainer's momentum residual on the TRUTH is ~1.5e4 per point, which the
+    network could only lower by bending rho away from the data. Origin of beta (presumably
+    an O(dx^2) lattice term) is unverified.
+  - The h5 velocity is the bare moment sum(f c) / rho. The physical (Guo) velocity is
+    u = u_h5 + F / (2 rho), F the force density below; without it the interface carries a
+    frozen "parasitic" shell and continuity fails ~2e4x worse. get_training_data_3d_pr
+    applies the correction before supervising u, v, w.
 
 Body force. LBPM ramps it (ColorModel.cpp, lfz += flux_increment every 20000 steps) over
 the whole periodic domain, so g(t) = FORCE_INCREMENT * floor(t / FORCE_RAMP_INTERVAL):
@@ -53,6 +60,9 @@ K_FACTOR = 0.5               # Domain/k_factor; enters the momentum equation as 
 # 20000 steps); the .db's F and body_force_z are both 0.
 FORCE_INCREMENT = 2e-6
 FORCE_RAMP_INTERVAL = 20000
+# Extra rho-independent Korteweg-like coefficient the CFD obeys (lattice units, see the
+# module docstring): F_kort = (kappa rho + LATTICE_BETA) grad(lap(rho)). Fit: 0.0847.
+LATTICE_BETA = 1.0 / 12.0
 
 
 def pr_constants():
@@ -68,6 +78,33 @@ def pressure_pr(rho):
     T, aT = pr_constants()
     b = PR_B
     return T * rho / (1.0 - b * rho) - aT * rho * rho / (1.0 + 2.0 * b * rho - (b * rho) ** 2)
+
+
+def periodic_d1(f, axis):
+    ''' Central first derivative on the periodic lattice, unit spacing. '''
+    return 0.5 * (np.roll(f, -1, axis=axis) - np.roll(f, 1, axis=axis))
+
+
+def periodic_lap(f):
+    ''' 7-point Laplacian on the periodic lattice, unit spacing. '''
+    return sum(np.roll(f, -1, axis=a) - 2.0 * f + np.roll(f, 1, axis=a) for a in range(f.ndim))
+
+
+def lbpm_force(rho, t_lattice):
+    ''' LBPM's cp-model force density (dvc_update_force_cp), lattice units, for a (Z, Y, X)
+    density snapshot: F = -rho grad(mu) + (1/3) grad(rho) + rho g, written through
+    Gibbs-Duhem as -k^2 grad(P_PR) + kappa rho grad(lap(rho)) + (1/3) grad(rho) + rho g.
+    Returns [Fx, Fy, Fz]. '''
+    P = pressure_pr(rho)
+    lap_rho = periodic_lap(rho)
+    F = []
+    for c, axis in (("x", 2), ("y", 1), ("z", 0)):
+        f = -K_FACTOR ** 2 * periodic_d1(P, axis) + PR_KAPPA * rho * periodic_d1(lap_rho, axis) + \
+            periodic_d1(rho, axis) / 3.0
+        if c == "z":
+            f = f + rho * body_force(t_lattice)
+        F.append(f)
+    return F
 
 
 def body_force(t_lattice):
@@ -88,7 +125,10 @@ def measure_bulk_acceleration(h5_path):
         momentum, mass = [], []
         for i in range(len(times)):
             rho = np.array(data["density"][i], dtype=float)
-            momentum.append((rho * np.array(data["velocityZ"][i], dtype=float)).sum())
+            # Half-force corrected momentum: the gradient parts of F sum to zero over the
+            # periodic box, so sum(rho u) = sum(rho u_h5) + mass g(t) / 2.
+            momentum.append((rho * np.array(data["velocityZ"][i], dtype=float)).sum() +
+                            0.5 * rho.sum() * body_force(times[i]))
             mass.append(rho.sum())
     momentum, mass = np.array(momentum), np.array(mass)
     accel = np.diff(momentum) / np.diff(times) / mass[:-1]
@@ -132,7 +172,9 @@ def get_training_data_3d_pr(NOP_DATA, NOP_PDE, supervised=("rho",),
         supervised: which of "rho", "u", "v", "w", "p" to supervise besides a. Density
             alone is the physics-inferred setup (velocities and pressure come from the
             PDEs); adding "u", "v", "w" gives a fully data-assisted run.
-        time_indices: snapshots to use; None takes every second one.
+        time_indices: snapshots to use; None takes all of them. Every second one (800
+            steps) is too coarse for rho_t once the drop is moving: continuity on the truth
+            is ~10x worse at the interface late in the run than with 400 steps.
 
     Returns (frames, scales). frames["DATA"] has x, y, z, t, then one column per
     supervised field (nondimensional), then a. '''
@@ -144,13 +186,22 @@ def get_training_data_3d_pr(NOP_DATA, NOP_PDE, supervised=("rho",),
         Z = np.array(data["Z"], dtype=float)
         times_all = np.array(data["time"], dtype=float)
         if time_indices is None:
-            time_indices = np.arange(0, len(times_all), 2)
+            time_indices = np.arange(len(times_all))
         time_indices = np.sort(np.asarray(time_indices))
         times = times_all[time_indices]
         levelset_raw = np.array(data["levelset"][time_indices], dtype=float)
         density = np.array(data["density"][time_indices], dtype=float)
         raw = {k: density if k == "rho" else np.array(data[h5_names[k]][time_indices], dtype=float)
                for k in supervised}
+
+    # u_h5 -> physical velocity. Needs all three force components only for the
+    # supervised ones, but lbpm_force is cheap enough to compute whole per snapshot.
+    vel_keys = [k for k in ("u", "v", "w") if k in supervised]
+    if vel_keys:
+        for i, t in enumerate(times):
+            F = lbpm_force(density[i], t)
+            for k in vel_keys:
+                raw[k][i] += 0.5 * F["uvw".index(k)] / density[i]
 
     # Cubic lattice cells, centred on the origin (see generate_points_3d.py).
     X, Y, Z = X / np.diff(X)[0], Y / np.diff(Y)[0], Z / np.diff(Z)[0]
