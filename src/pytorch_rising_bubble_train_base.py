@@ -2,12 +2,15 @@ import sys
 sys.path.append("../utilities")
 import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-GPU_ID = "0"
-os.environ["CUDA_VISIBLE_DEVICES"] = GPU_ID
+# Under torchrun each rank picks its GPU via LOCAL_RANK, so don't hide the others
+if "LOCAL_RANK" not in os.environ:
+    GPU_ID = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = GPU_ID
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import pandas as pd
@@ -22,9 +25,20 @@ import shutil
 import logging
 import matplotlib.pyplot as plt
 
+# Distributed setup (torchrun sets these; plain `python` runs as a single rank)
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+RANK = int(os.environ.get("RANK", 0))
+WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+IS_DISTRIBUTED = WORLD_SIZE > 1
+IS_MAIN = RANK == 0
+
 # Set device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+if torch.cuda.is_available():
+    torch.cuda.set_device(LOCAL_RANK)
+    device = torch.device(f"cuda:{LOCAL_RANK}")
+else:
+    device = torch.device("cpu")
+print(f"Rank {RANK}/{WORLD_SIZE} using device: {device}")
 
 # Set random seeds for reproducibility
 np.random.seed(1234)
@@ -330,6 +344,21 @@ class TwoPhasePinn(nn.Module):
         return [torch.tensor(l) for l in total_losses]
 
 
+def allreduce_gradients(model):
+    """Average gradients across ranks (one coalesced all-reduce per optimizer step)"""
+    if not IS_DISTRIBUTED:
+        return
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    flat = torch.cat([g.reshape(-1) for g in grads])
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    flat /= WORLD_SIZE
+    offset = 0
+    for g in grads:
+        n = g.numel()
+        g.copy_(flat[offset:offset + n].view_as(g))
+        offset += n
+
+
 def setup_output_directory():
     """Setup output directory for checkpoints and logs"""
     if not os.path.exists("checkpoints"):
@@ -347,9 +376,12 @@ def setup_output_directory():
 
 
 def get_logger(logpath):
-    """Setup logger"""
+    """Setup logger (only rank 0 writes)"""
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
+    if logpath is None:
+        logger.addHandler(logging.NullHandler())
+        return logger
     
     sh = logging.StreamHandler()
     sh.setFormatter(logging.Formatter('%(message)s'))
@@ -421,8 +453,17 @@ def get_batch_tensors(gpu_data, indices, key, start_idx, end_idx, columns=None):
 
 def main():
     """Main training loop"""
-    dirname, logpath = setup_output_directory()
+    if IS_DISTRIBUTED:
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo",
+                                device_id=device if torch.cuda.is_available() else None)
+    
+    if IS_MAIN:
+        dirname, logpath = setup_output_directory()
+    else:
+        dirname, logpath = None, None
     logger = get_logger(logpath)
+    if IS_DISTRIBUTED:
+        logger.info(f"Distributed training on {WORLD_SIZE} ranks")
     
     NOP_a = (500, 400)
     NOP_PDE = (400, 2000, 3000)
@@ -431,7 +472,14 @@ def main():
     NOP_east = (20, 20)
     NOP_west = (20, 20)
     
-    training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
+    # Rank 0 generates the points; broadcast so every rank shards the same set
+    training_data = None
+    if IS_MAIN:
+        training_data = get_training_data(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_west)
+    if IS_DISTRIBUTED:
+        obj = [training_data]
+        dist.broadcast_object_list(obj, src=0)
+        training_data = obj[0]
     
     logger.info("Pre-loading training data to GPU...")
     gpu_training_data, data_lengths = preload_training_data_to_gpu(training_data)
@@ -500,8 +548,14 @@ def main():
     
     # Load initial weights if available
     if os.path.exists('initial_weights.pth'):
-        pinn.load_state_dict(torch.load('initial_weights.pth'))
+        pinn.load_state_dict(torch.load('initial_weights.pth', map_location=device))
         logger.info("Loaded initial weights from initial_weights.pth")
+    
+    # Start every rank from rank 0's weights
+    if IS_DISTRIBUTED:
+        with torch.no_grad():
+            for p in pinn.parameters():
+                dist.broadcast(p.data, src=0)
     
     start_total = time.time()
     
@@ -512,6 +566,11 @@ def main():
     optimizer = optim.Adam(pinn.parameters(), lr=learning_rates[0])
     current_best_total_loss = float('inf')
     
+    # Same seed on every rank -> identical global permutation each epoch, which
+    # each rank then strides into a disjoint shard
+    shuffle_gen = torch.Generator(device=device)
+    shuffle_gen.manual_seed(1234)
+    
     for i, (epochs, lr) in enumerate(zip(epochs_list, learning_rates)):
         logger.info(f"\n--- Starting Training Phase {i+1}/{len(epochs_list)} ---")
         logger.info(f"Epochs: {epochs}, Learning Rate: {lr}")
@@ -521,6 +580,9 @@ def main():
         
         prop_batch_sizes, num_batches = get_proportional_batch_sizes(total_batch_size, 
                                                                      training_data, logger)
+        # Each rank takes 1/WORLD_SIZE of every global batch, so the averaged
+        # gradient per optimizer step matches the single-GPU run
+        rank_batch_sizes = {k: math.ceil(v / WORLD_SIZE) for k, v in prop_batch_sizes.items()}
         start_checkpoint_time = time.time()
         
         accumulation_steps = 3  # Add this near the top of main(), after num_of_batches
@@ -528,7 +590,8 @@ def main():
         for epoch in range(1, epochs + 1):
             epoch_losses = []
             shuffled_indices = {
-                key: torch.randperm(data_lengths[key], device=device) 
+                key: torch.randperm(data_lengths[key], device=device,
+                                    generator=shuffle_gen)[RANK::WORLD_SIZE]
                 for key in gpu_training_data.keys()
             }
             
@@ -538,26 +601,26 @@ def main():
             for b in range(num_batches):
                 data_A = get_batch_tensors(
                     gpu_training_data, shuffled_indices, 'A',
-                    b * prop_batch_sizes['A'], 
-                    (b + 1) * prop_batch_sizes['A']
+                    b * rank_batch_sizes['A'], 
+                    (b + 1) * rank_batch_sizes['A']
                 )
                 
                 data_PDE = get_batch_tensors(
                     gpu_training_data, shuffled_indices, 'PDE',
-                    b * prop_batch_sizes['PDE'], 
-                    (b + 1) * prop_batch_sizes['PDE'],
+                    b * rank_batch_sizes['PDE'], 
+                    (b + 1) * rank_batch_sizes['PDE'],
                     columns=['x_PDE', 'y_PDE', 't_PDE']
                 )
                 
                 data_N = get_batch_tensors(
                     gpu_training_data, shuffled_indices, 'N',
-                    b * prop_batch_sizes['N'], 
-                    (b + 1) * prop_batch_sizes['N']
+                    b * rank_batch_sizes['N'], 
+                    (b + 1) * rank_batch_sizes['N']
                 )
                 
                 # For EW, we need specific columns in specific order
-                ew_start = b * prop_batch_sizes['EW']
-                ew_end = (b + 1) * prop_batch_sizes['EW']
+                ew_start = b * rank_batch_sizes['EW']
+                ew_end = (b + 1) * rank_batch_sizes['EW']
                 ew_indices = shuffled_indices['EW'][ew_start:ew_end]
                 data_EW = (
                     gpu_training_data['EW']['x_E'][ew_indices],
@@ -569,8 +632,8 @@ def main():
                 
                 data_NSEW = get_batch_tensors(
                     gpu_training_data, shuffled_indices, 'NSEW',
-                    b * prop_batch_sizes['NSEW'], 
-                    (b + 1) * prop_batch_sizes['NSEW']
+                    b * rank_batch_sizes['NSEW'], 
+                    (b + 1) * rank_batch_sizes['NSEW']
                 )
                 
                 # Forward and backward (accumulate gradients)
@@ -583,11 +646,16 @@ def main():
                 
                 # Only step optimizer every accumulation_steps batches
                 if accumulated_count >= accumulation_steps or (b + 1) == num_batches:
+                    allreduce_gradients(pinn)
                     optimizer.step()
                     optimizer.zero_grad()
                     accumulated_count = 0
             
             avg_losses = np.mean(epoch_losses, axis=0)
+            if IS_DISTRIBUTED:
+                loss_t = torch.tensor(avg_losses, dtype=torch.float64, device=device)
+                dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
+                avg_losses = (loss_t / WORLD_SIZE).cpu().numpy()
             total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_pde_a = avg_losses
             
             history_loss_a.append(loss_a)
@@ -604,7 +672,7 @@ def main():
                 logger.info(log_msg)
             
             # Save best model
-            if epoch % checkpoint_interval == 0 and total_loss < current_best_total_loss:
+            if IS_MAIN and epoch % checkpoint_interval == 0 and total_loss < current_best_total_loss:
                 logger.info(f"Saving checkpoint at epoch {epoch} with loss {total_loss:.4e}")
                 # Remove previous checkpoint
                 for f in glob.glob(os.path.join(dirname, "*.pth")):
@@ -616,6 +684,13 @@ def main():
                 current_best_total_loss = total_loss
     
     total_training_time = time.time() - start_total
+    
+    # Evaluation, plots and history are rank 0 only
+    if IS_DISTRIBUTED:
+        dist.barrier()
+        dist.destroy_process_group()
+    if not IS_MAIN:
+        return
     logger.info(f"\nTotal training time: {total_training_time:.3f}s")
     
     logger.info("\n" + "="*50)
@@ -626,7 +701,7 @@ def main():
     if list_of_files:
         latest_file = max(list_of_files, key=os.path.getctime)
         logger.info(f"Loading best model weights from: {os.path.basename(latest_file)}\n")
-        pinn.load_state_dict(torch.load(latest_file))
+        pinn.load_state_dict(torch.load(latest_file, map_location=device))
     else:
         logger.info("No checkpoint file found. Evaluating with final weights from training.\n")
     
@@ -634,7 +709,7 @@ def main():
     final_evaluation_losses = []
     
     pinn.eval()
-    with torch.no_grad():
+    with torch.enable_grad():  # PDE residuals need autograd.grad w.r.t. inputs
         for b in range(num_batches):
             batch_dict = {}
             for key, df in training_data.items():
