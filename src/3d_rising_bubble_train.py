@@ -73,12 +73,12 @@ class TwoPhasePinn(tf.keras.Model):
 
     def __init__(self, hidden_layers, activation_functions, adaptive_activation_coeff,
                  adaptive_activation_n, adaptive_activation_init, use_ad_act,
-                 loss_weights_PDE, mu, kappa, g, rho, u_ref, L_ref, period):
+                 loss_weights_PDE, mu, sigma, g, rho, u_ref, L_ref, period):
         super(TwoPhasePinn, self).__init__()
 
         # Physical Parameters
         self.mu1, self.mu2 = mu
-        self.kappa = kappa
+        self.sigma = sigma
         self.g = g
         self.rho1, self.rho2 = rho
         self.U_ref = u_ref
@@ -133,125 +133,96 @@ class TwoPhasePinn(tf.keras.Model):
 
     @tf.function
     def compute_gradients(self, x, y, z, t):
-        # THREE nested tapes. The Korteweg force needs grad(lap(a)), a THIRD derivative,
-        # so the second-order gradients must themselves be taken inside a tape (tape3).
-        with tf.GradientTape(persistent=True) as tape3:
-            tape3.watch([x, y, z, t])
-            with tf.GradientTape(persistent=True) as tape2:
-                tape2.watch([x, y, z, t])
-                with tf.GradientTape(persistent=True) as tape1:
-                    tape1.watch([x, y, z, t])
-                    u, v, w, p, a = self.call(tf.concat([x, y, z, t], axis=1))
+        # Use a nested tape to compute second-order derivatives
+        with tf.GradientTape(persistent=True) as tape2:
+            tape2.watch([x, y, z, t])
+            with tf.GradientTape(persistent=True) as tape1:
+                tape1.watch([x, y, z, t])
+                u, v, w, p, a = self.call(tf.concat([x, y, z, t], axis=1))
 
-                # First-order gradients computed with the inner tape
-                u_x = tape1.gradient(u, x)
-                u_y = tape1.gradient(u, y)
-                u_z = tape1.gradient(u, z)
-                u_t = tape1.gradient(u, t)
-                v_x = tape1.gradient(v, x)
-                v_y = tape1.gradient(v, y)
-                v_z = tape1.gradient(v, z)
-                v_t = tape1.gradient(v, t)
-                w_x = tape1.gradient(w, x)
-                w_y = tape1.gradient(w, y)
-                w_z = tape1.gradient(w, z)
-                w_t = tape1.gradient(w, t)
-                p_x = tape1.gradient(p, x)
-                p_y = tape1.gradient(p, y)
-                p_z = tape1.gradient(p, z)
-                a_x = tape1.gradient(a, x)
-                a_y = tape1.gradient(a, y)
-                a_z = tape1.gradient(a, z)
-                a_t = tape1.gradient(a, t)
+            # First-order gradients computed with the inner tape
+            u_x = tape1.gradient(u, x)
+            u_y = tape1.gradient(u, y)
+            u_z = tape1.gradient(u, z)
+            u_t = tape1.gradient(u, t)
+            v_x = tape1.gradient(v, x)
+            v_y = tape1.gradient(v, y)
+            v_z = tape1.gradient(v, z)
+            v_t = tape1.gradient(v, t)
+            w_x = tape1.gradient(w, x)
+            w_y = tape1.gradient(w, y)
+            w_z = tape1.gradient(w, z)
+            w_t = tape1.gradient(w, t)
+            p_x = tape1.gradient(p, x)
+            p_y = tape1.gradient(p, y)
+            p_z = tape1.gradient(p, z)
+            a_x = tape1.gradient(a, x)
+            a_y = tape1.gradient(a, y)
+            a_z = tape1.gradient(a, z)
+            a_t = tape1.gradient(a, t)
 
-            # Second-order gradients, taken INSIDE tape3 so it can differentiate them again
-            u_xx = tape2.gradient(u_x, x)
-            u_yy = tape2.gradient(u_y, y)
-            u_zz = tape2.gradient(u_z, z)
-            v_xx = tape2.gradient(v_x, x)
-            v_yy = tape2.gradient(v_y, y)
-            v_zz = tape2.gradient(v_z, z)
-            w_xx = tape2.gradient(w_x, x)
-            w_yy = tape2.gradient(w_y, y)
-            w_zz = tape2.gradient(w_z, z)
-            a_xx = tape2.gradient(a_x, x)
-            a_yy = tape2.gradient(a_y, y)
-            a_zz = tape2.gradient(a_z, z)
-            # The mixed second derivatives a_xy/a_xz/a_yz that the sharp-interface
-            # curvature needed are gone with it; the free-energy model wants grad(lap(a)).
-            lap_a = a_xx + a_yy + a_zz
-            # Velocity divergence: a residual term in continuity now that the flow is not
-            # incompressible, and its gradient enters the compressible viscous stress.
-            div_u = u_x + v_y + w_z
-
-        # Third-order gradients
-        lap_a_x = tape3.gradient(lap_a, x)
-        lap_a_y = tape3.gradient(lap_a, y)
-        lap_a_z = tape3.gradient(lap_a, z)
-        div_x = tape3.gradient(div_u, x)
-        div_y = tape3.gradient(div_u, y)
-        div_z = tape3.gradient(div_u, z)
+        # Second-order gradients computed with the outer tape
+        u_xx = tape2.gradient(u_x, x)
+        u_yy = tape2.gradient(u_y, y)
+        u_zz = tape2.gradient(u_z, z)
+        v_xx = tape2.gradient(v_x, x)
+        v_yy = tape2.gradient(v_y, y)
+        v_zz = tape2.gradient(v_z, z)
+        w_xx = tape2.gradient(w_x, x)
+        w_yy = tape2.gradient(w_y, y)
+        w_zz = tape2.gradient(w_z, z)
+        a_xx = tape2.gradient(a_x, x)
+        a_yy = tape2.gradient(a_y, y)
+        a_zz = tape2.gradient(a_z, z)
+        a_xy = tape2.gradient(a_x, y)
+        a_xz = tape2.gradient(a_x, z)
+        a_yz = tape2.gradient(a_y, z)
 
         # Clean up tapes
-        del tape1, tape2, tape3
+        del tape1, tape2
 
         return (u, u_x, u_y, u_z, u_t, u_xx, u_yy, u_zz), \
                (v, v_x, v_y, v_z, v_t, v_xx, v_yy, v_zz), \
                (w, w_x, w_y, w_z, w_t, w_xx, w_yy, w_zz), \
                (p, p_x, p_y, p_z), \
-               (a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz), \
-               (lap_a_x, lap_a_y, lap_a_z, div_u, div_x, div_y, div_z)
+               (a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz, a_xy, a_xz, a_yz)
 
     @tf.function
     def PDE_caller(self, x, y, z, t):
-        """Residuals of the equations LBPM actually integrates -- see the PyTorch twin,
-        pytorch_3d_rising_bubble_train.PDE_caller, for the full reasoning. In short, the
-        data is a single-component Peng-Robinson free-energy run, so: continuity carries
-        mass exchange across the interface (and absorbs the old volume-fraction advection
-        equation), surface tension is the Korteweg force kappa*rho*grad(lap(rho)) with
-        kappa straight from the .db rather than a fitted sigma, and the viscous stress
-        carries its compressible -(2/3)*mu*div(u) part."""
-        u_grads, v_grads, w_grads, p_grads, a_grads, extra = self.compute_gradients(x, y, z, t)
+        u_grads, v_grads, w_grads, p_grads, a_grads = self.compute_gradients(x, y, z, t)
         u, u_x, u_y, u_z, u_t, u_xx, u_yy, u_zz = u_grads
         v, v_x, v_y, v_z, v_t, v_xx, v_yy, v_zz = v_grads
         w, w_x, w_y, w_z, w_t, w_xx, w_yy, w_zz = w_grads
         p, p_x, p_y, p_z = p_grads
-        a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz = a_grads
-        lap_a_x, lap_a_y, lap_a_z, div_u, div_x, div_y, div_z = extra
+        a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz, a_xy, a_xz, a_yz = a_grads
 
         mu = self.mu2 + (self.mu1 - self.mu2) * a
         mu_x = (self.mu1 - self.mu2) * a_x
         mu_y = (self.mu1 - self.mu2) * a_y
         mu_z = (self.mu1 - self.mu2) * a_z
         rho = self.rho2 + (self.rho1 - self.rho2) * a
-        # Nondimensional density and its slope w.r.t. a: rho* = 1 + drho_da * a.
-        rho_star = rho / self.rho_ref
-        drho_da = (self.rho1 - self.rho2) / self.rho_ref
+
+        abs_interface_grad = tf.sqrt(a_x**2 + a_y**2 + a_z**2 + np.finfo(float).eps)
+        # 3D mean curvature of the levelset -div(grad(a)/|grad(a)|)
+        curvature = -(((a_yy + a_zz) * a_x**2 + (a_xx + a_zz) * a_y**2 + (a_xx + a_yy) * a_z**2
+                        - 2 * a_x * a_y * a_xy - 2 * a_x * a_z * a_xz - 2 * a_y * a_z * a_yz)
+                      / tf.pow(abs_interface_grad, 3))
 
         one_Re = mu / (self.rho_ref * self.U_ref * self.L_ref)
         one_Re_x = mu_x / (self.rho_ref * self.U_ref * self.L_ref)
         one_Re_y = mu_y / (self.rho_ref * self.U_ref * self.L_ref)
         one_Re_z = mu_z / (self.rho_ref * self.U_ref * self.L_ref)
-        # Korteweg coefficient, on the same rho_ref*U_ref^2/L_ref scale as the other terms.
-        Ko = self.kappa * self.rho_ref / (self.L_ref**2 * self.U_ref**2)
+        one_We = self.sigma / (self.rho_ref * self.U_ref**2 * self.L_ref)
         one_Fr = self.g * self.L_ref / self.U_ref**2
 
-        # CONTINUITY with mass exchange: d(rho*)/dt + div(rho* u) = 0.
-        PDE_m = drho_da * (a_t + u * a_x + v * a_y + w * a_z) + rho_star * div_u
-
-        # Korteweg force per unit volume, grad(lap(rho*)) = drho_da * grad(lap(a)).
-        F_ko_x = Ko * rho_star * drho_da * lap_a_x
-        F_ko_y = Ko * rho_star * drho_da * lap_a_y
-        F_ko_z = Ko * rho_star * drho_da * lap_a_z
-
-        PDE_u = (u_t + u * u_x + v * u_y + w * u_z) * rho_star + p_x - \
-                F_ko_x - one_Re * (u_xx + u_yy + u_zz) - \
-                2.0 * one_Re_x * u_x - one_Re_y * (u_y + v_x) - one_Re_z * (u_z + w_x) + \
-                (2.0 / 3.0) * (one_Re * div_x + one_Re_x * div_u)
-        PDE_v = (v_t + u * v_x + v * v_y + w * v_z) * rho_star + p_y - \
-                F_ko_y - one_Re * (v_xx + v_yy + v_zz) - \
-                2.0 * one_Re_y * v_y - one_Re_x * (u_y + v_x) - one_Re_z * (v_z + w_y) + \
-                (2.0 / 3.0) * (one_Re * div_y + one_Re_y * div_u)
+        PDE_m = u_x + v_y + w_z
+        PDE_a = a_t + u * a_x + v * a_y + w * a_z
+        PDE_u = (u_t + u * u_x + v * u_y + w * u_z) * rho / self.rho_ref + p_x - \
+                one_We * curvature * a_x - one_Re * (u_xx + u_yy + u_zz) - \
+                2.0 * one_Re_x * u_x - one_Re_y * (u_y + v_x) - one_Re_z * (u_z + w_x)
+        PDE_v = (v_t + u * v_x + v * v_y + w * v_z) * rho / self.rho_ref + p_y - \
+                one_We * curvature * a_y - one_Re * (v_xx + v_yy + v_zz) - \
+                2.0 * one_Re_y * v_y - one_Re_x * (u_y + v_x) - one_Re_z * (v_z + w_y)
         # Gravity acts along z (see generate_points_3d.py), so the body-force term
         # lives in the w-momentum equation here instead of the v-momentum equation.
         #
@@ -274,13 +245,12 @@ class TwoPhasePinn(tf.keras.Model):
         # gravity: <rho/rho_ref * w_t> balances <rho/rho_ref> * (1/Fr) while <p_z> = 0.
         # Subtracting rho_mean would instead demand a mean acceleration of zero, which
         # the data contradicts directly.
-        PDE_w = (w_t + u * w_x + v * w_y + w * w_z) * rho_star + p_z - \
-                F_ko_z - one_Re * (w_xx + w_yy + w_zz) - \
-                rho_star * one_Fr - 2.0 * one_Re_z * w_z - \
-                one_Re_x * (u_z + w_x) - one_Re_y * (v_z + w_y) + \
-                (2.0 / 3.0) * (one_Re * div_z + one_Re_z * div_u)
+        PDE_w = (w_t + u * w_x + v * w_y + w * w_z) * rho / self.rho_ref + p_z - \
+                one_We * curvature * a_z - one_Re * (w_xx + w_yy + w_zz) - \
+                rho / self.rho_ref * one_Fr - 2.0 * one_Re_z * w_z - \
+                one_Re_x * (u_z + w_x) - one_Re_y * (v_z + w_y)
 
-        return PDE_m, PDE_u, PDE_v, PDE_w
+        return PDE_m, PDE_u, PDE_v, PDE_w, PDE_a
 
     @tf.function
     def compute_loss(self, data_A, data_PDE, data_GAUGE):
@@ -302,19 +272,19 @@ class TwoPhasePinn(tf.keras.Model):
         loss_gauge = tf.reduce_mean(tf.square(p_G - pred_p_G))
 
         # Loss PDE (Physics-Informed)
-        # Four residuals now, not five: continuity absorbs the old advection equation.
-        PDE_m, PDE_u, PDE_v, PDE_w = self.PDE_caller(x_PDE, y_PDE, z_PDE, t_PDE)
+        PDE_m, PDE_u, PDE_v, PDE_w, PDE_a = self.PDE_caller(x_PDE, y_PDE, z_PDE, t_PDE)
         loss_PDE_m = tf.reduce_mean(tf.square(f_PDE - PDE_m))
         loss_PDE_u = tf.reduce_mean(tf.square(f_PDE - PDE_u))
         loss_PDE_v = tf.reduce_mean(tf.square(f_PDE - PDE_v))
         loss_PDE_w = tf.reduce_mean(tf.square(f_PDE - PDE_w))
+        loss_PDE_a = tf.reduce_mean(tf.square(f_PDE - PDE_a))
 
-        loss_PDE = tf.tensordot(tf.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w]), self.loss_weights_PDE, 1)
+        loss_PDE = tf.tensordot(tf.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a]), self.loss_weights_PDE, 1)
 
         # Total Loss
         total_loss = loss_a_A + loss_gauge + loss_PDE
 
-        return total_loss, loss_a_A, loss_gauge, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w
+        return total_loss, loss_a_A, loss_gauge, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a
 
 
     @tf.function
@@ -436,18 +406,15 @@ def main():
     # values, which were SI quantities for a light bubble in water and had no
     # correspondence to this lattice-unit run of a dense drop in gas.
     mu = scales["mu"]            # [drop, carrier] dynamic viscosity = rho * nu
-    kappa = scales["kappa"]      # Color/pr_kappa: the Korteweg coefficient, straight from the .db
+    sigma = scales["sigma"]      # measured by Laplace's law (emergent from the PR EOS)
     g = scales["g"]              # Color/F = 0,0,+2e-6, per unit mass, along +z
     rho = scales["rho"]          # [rhoA drop, rhoB carrier]
     u_ref = scales["U_ref"]
     L_ref = scales["L_ref"]
     logger.info(f"Reference scales: L_ref={L_ref:.4f} cells, U_ref={u_ref:.6g} cells/step, "
                 f"T_ref={scales['T_ref']:.1f} steps")
-    logger.info(f"mu={mu}, rho={rho}, kappa={kappa}, g={g}, rho_mean={scales['rho_mean']:.5f}")
-    logger.info(f"Ko = {kappa * rho[1] / (L_ref ** 2 * u_ref ** 2):.4f} "
-                f"(measured sigma {scales['sigma']:.4g} is diagnostic only now)")
-    # [continuity, u, v, w] -- the volume-fraction advection residual is gone.
-    loss_weights_PDE = [1.0, 10.0, 10.0, 10.0]
+    logger.info(f"mu={mu}, rho={rho}, sigma={sigma}, g={g}, rho_mean={scales['rho_mean']:.5f}")
+    loss_weights_PDE = [1.0, 10.0, 10.0, 10.0, 1.0]
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
     checkpoint_interval = 10
@@ -458,7 +425,7 @@ def main():
 
     pinn = TwoPhasePinn(hidden_layers, activation_functions, adaptive_activation_coeff,
                       adaptive_activation_n, adaptive_activation_init, use_adaptive_activation,
-                      loss_weights_PDE, mu, kappa, g, rho, u_ref, L_ref, scales["period"])
+                      loss_weights_PDE, mu, sigma, g, rho, u_ref, L_ref, scales["period"])
     logger.info(f"Periodic lengths (nondimensional): {scales['period']}")
 
     pinn.nn.load_weights('initial_weights_3d.h5')
@@ -467,7 +434,7 @@ def main():
 
     history_loss_a = []
     history_loss_f_uvw = []
-    history_loss_f_m = []
+    history_loss_f_ma = []
 
     def to_tensor_tuple(df, columns):
         return tuple(tf.constant(df[c].to_numpy().reshape(-1, 1), dtype=tf.float32) for c in columns)
@@ -513,11 +480,11 @@ def main():
                 epoch_losses.append([l.numpy() for l in batch_loss_values])
 
             sum_losses = np.sum(epoch_losses, axis=0)
-            total_loss, loss_a, loss_gauge, loss_m, loss_u, loss_v, loss_w = sum_losses
+            total_loss, loss_a, loss_gauge, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_losses
 
             history_loss_a.append(loss_a)
             history_loss_f_uvw.append(loss_u + loss_v + loss_w)
-            history_loss_f_m.append(loss_m)
+            history_loss_f_ma.append(loss_m + loss_pde_a)
 
             if epoch % checkpoint_interval == 0:
                 current_time = time.time()
@@ -525,7 +492,7 @@ def main():
                 start_checkpoint_time = current_time
                 log_msg = f"Epoch: {epoch}/{epochs} - Time: {time_for_epoch:.2f}s - Loss: {total_loss:.4e}"
                 log_msg += f" | a: {loss_a:.4e}, BC: {loss_gauge:.4e}, m: {loss_m:.4e}"
-                log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, w: {loss_w:.4e}"
+                log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, w: {loss_w:.4e}, pde_a: {loss_pde_a:.4e}"
                 logger.info(log_msg)
 
             # Saves weights every 'checkpoint_interval' epochs, overwriting the previous file.
@@ -577,15 +544,16 @@ def main():
 
     # Calculate the mean loss across all batches
     sum_final_losses = np.sum(final_evaluation_losses, axis=0)
-    _, loss_a, loss_gauge, loss_m, loss_u, loss_v, loss_w = sum_final_losses
+    _, loss_a, loss_gauge, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_final_losses
 
     logger.info("--- Final Loss Breakdown ---")
     logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")
     logger.info(f"MSE_BC                     : {loss_gauge:.4e}")
-    logger.info(f"MSE_f,m (continuity)       : {loss_m:.4e}")
+    logger.info(f"MSE_f,m                    : {loss_m:.4e}")
     logger.info(f"MSE_f,u                    : {loss_u:.4e}")
     logger.info(f"MSE_f,v                    : {loss_v:.4e}")
     logger.info(f"MSE_f,w                    : {loss_w:.4e}")
+    logger.info(f"MSE_f,a                    : {loss_pde_a:.4e}")
     logger.info("----------------------------\n")
 
     # --- Plotting and Saving History (No changes needed here) ---
@@ -614,13 +582,13 @@ def main():
 
     # Plot 3: MSE_f,m + MSE_f,a
     plt.figure(figsize=(10, 6))
-    plt.plot(epochs_range, history_loss_f_m)
-    plt.title(f'MSE of Continuity vs. Epochs ({adaptive_mode} - {activation_choice})')
+    plt.plot(epochs_range, history_loss_f_ma)
+    plt.title(f'MSE of Conservation (m,a) vs. Epochs ({adaptive_mode} - {activation_choice})')
     plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss (f_m)')
+    plt.ylabel('MSE Loss (f_m + f_a)')
     plt.yscale('log')
     plt.grid(True, which="both", ls="--")
-    plt.savefig(os.path.join(dirname, 'loss_history_continuity.png'))
+    plt.savefig(os.path.join(dirname, 'loss_history_conservation_ma.png'))
 
     plt.close('all') # Close all figures to free memory
     logger.info("Plots saved successfully.")
@@ -633,7 +601,7 @@ def main():
         'epoch': epochs_range,
         'MSE_alpha': history_loss_a,
         'MSE_f_uvw': history_loss_f_uvw,
-        'MSE_f_m': history_loss_f_m
+        'MSE_f_ma': history_loss_f_ma
     })
 
     history_df.to_csv(history_filepath, index=False)

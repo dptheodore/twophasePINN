@@ -18,7 +18,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from generate_points_3d import get_training_data_3d
+from generate_points_3d import get_training_data_3d, lift_2d_initial_weights
 from pytorch_utilities import NNCreator, writeToJSONFile
 
 # Every rank seeds identically and so generates the SAME training points. The data is
@@ -30,7 +30,7 @@ torch.manual_seed(1234)
 
 Physics = namedtuple(
     "Physics",
-    ["mu1", "mu2", "kappa", "g", "rho1", "rho2", "U_ref", "L_ref", "rho_ref",
+    ["mu1", "mu2", "sigma", "g", "rho1", "rho2", "U_ref", "L_ref", "rho_ref",
      "loss_weights_PDE"],
 )
 
@@ -45,6 +45,23 @@ def build_activation_dict(hidden_layers, activation_functions, adaptive_activati
                 func_name = name
         activation_dict[layer_no] = [func_name, None, adaptive_activation_n[layer_no - 1]]
     return activation_dict
+
+
+def load_lifted_2d_weights(net, path):
+    """Loads the 2D Keras starting weights, lifted to 3D by
+    generate_points_3d.lift_2d_initial_weights, into an NNCreator network. Keras kernels
+    are (in, out) and torch Linear weights (out, in), hence the transposes."""
+    weights = lift_2d_initial_weights(path)
+    state = {}
+    for i in range(len(net.hidden_layers)):
+        kernel, bias = weights["dense" if i == 0 else f"dense_{i}"]
+        state[f"hidden_layers.{i}.linear.weight"] = torch.tensor(kernel.T)
+        state[f"hidden_layers.{i}.linear.bias"] = torch.tensor(bias)
+    for name in net.output_layers:
+        kernel, bias = weights[name]
+        state[f"output_layers.{name}.weight"] = torch.tensor(kernel.T)
+        state[f"output_layers.{name}.bias"] = torch.tensor(bias)
+    net.load_state_dict(state)
 
 
 def compute_gradients(model, x, y, z, t):
@@ -100,134 +117,71 @@ def compute_gradients(model, x, y, z, t):
     a_xx = torch.autograd.grad(a_x, x, torch.ones_like(a_x), create_graph=True)[0]
     a_yy = torch.autograd.grad(a_y, y, torch.ones_like(a_y), create_graph=True)[0]
     a_zz = torch.autograd.grad(a_z, z, torch.ones_like(a_z), create_graph=True)[0]
-
-    # THIRD derivatives of a, for the Korteweg force kappa*rho*grad(lap(rho)). The mixed
-    # second derivatives a_xy/a_xz/a_yz the sharp-interface curvature needed are gone with
-    # it -- grad(lap(a)) is all the free-energy model asks for.
-    lap_a = a_xx + a_yy + a_zz
-    lap_a_x = torch.autograd.grad(lap_a, x, torch.ones_like(lap_a), create_graph=True)[0]
-    lap_a_y = torch.autograd.grad(lap_a, y, torch.ones_like(lap_a), create_graph=True)[0]
-    lap_a_z = torch.autograd.grad(lap_a, z, torch.ones_like(lap_a), create_graph=True)[0]
-
-    # Velocity divergence and its gradient. Both are needed now that the flow is NOT
-    # incompressible: div(u) is a residual term in continuity, and its gradient appears in
-    # the compressible part of the viscous stress.
-    div_u = u_x + v_y + w_z
-    div_x = torch.autograd.grad(div_u, x, torch.ones_like(div_u), create_graph=True)[0]
-    div_y = torch.autograd.grad(div_u, y, torch.ones_like(div_u), create_graph=True)[0]
-    div_z = torch.autograd.grad(div_u, z, torch.ones_like(div_u), create_graph=True)[0]
+    a_xy = torch.autograd.grad(a_x, y, torch.ones_like(a_x), create_graph=True)[0]
+    a_xz = torch.autograd.grad(a_x, z, torch.ones_like(a_x), create_graph=True)[0]
+    a_yz = torch.autograd.grad(a_y, z, torch.ones_like(a_y), create_graph=True)[0]
 
     return (u, u_x, u_y, u_z, u_t, u_xx, u_yy, u_zz), \
            (v, v_x, v_y, v_z, v_t, v_xx, v_yy, v_zz), \
            (w, w_x, w_y, w_z, w_t, w_xx, w_yy, w_zz), \
            (p, p_x, p_y, p_z), \
-           (a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz), \
-           (lap_a_x, lap_a_y, lap_a_z, div_u, div_x, div_y, div_z)
+           (a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz, a_xy, a_xz, a_yz)
 
 
 def PDE_caller(model, physics, x, y, z, t):
-    """Residuals of the equations LBPM actually integrates.
-
-    The dataset comes from eos_type = "cp": a SINGLE-COMPONENT Peng-Robinson free-energy
-    model (see the repo-root t14_forced_sphere.db). Three consequences, all of which the
-    earlier sharp-interface incompressible form got wrong:
-
-    1. Both phases are the same substance, so the interface exchanges mass by evaporation
-       and condensation instead of being advected as a material surface. Continuity is
-       d(rho)/dt + div(rho u) = 0, and there is no separate a_t + u.grad(a) = 0 equation --
-       it was forcing the interface to move with the fluid, which it does not. Measured on
-       this data div(u) is 1.29x the size of its own terms, so the incompressible form
-       could never have driven its residual to zero honestly.
-    2. Surface tension is not a sharp-interface sigma*curvature force; it is the Korteweg
-       (density-gradient) force kappa*rho*grad(lap(rho)), with kappa = Color/pr_kappa taken
-       straight from the .db. No sigma calibration is involved -- which is just as well,
-       since measuring sigma from this data is ambiguous by a factor of ~30 depending on
-       which cells are averaged.
-    3. With div(u) != 0 the viscous stress carries its compressible part, -(2/3)*mu*div(u)
-       on the diagonal (Stokes' hypothesis; LBPM's MRT bulk viscosity is not exactly this,
-       so it is an approximation, but a far smaller one than omitting the term).
-
-    p is the network's own field and is now interpretable as the thermodynamic pressure,
-    since the Korteweg force carries the interfacial stress that the CSF term used to.
-    """
-    u_grads, v_grads, w_grads, p_grads, a_grads, extra = compute_gradients(model, x, y, z, t)
+    u_grads, v_grads, w_grads, p_grads, a_grads = compute_gradients(model, x, y, z, t)
     u, u_x, u_y, u_z, u_t, u_xx, u_yy, u_zz = u_grads
     v, v_x, v_y, v_z, v_t, v_xx, v_yy, v_zz = v_grads
     w, w_x, w_y, w_z, w_t, w_xx, w_yy, w_zz = w_grads
     p, p_x, p_y, p_z = p_grads
-    a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz = a_grads
-    lap_a_x, lap_a_y, lap_a_z, div_u, div_x, div_y, div_z = extra
+    a, a_x, a_y, a_z, a_t, a_xx, a_yy, a_zz, a_xy, a_xz, a_yz = a_grads
 
     mu = physics.mu2 + (physics.mu1 - physics.mu2) * a
     mu_x = (physics.mu1 - physics.mu2) * a_x
     mu_y = (physics.mu1 - physics.mu2) * a_y
     mu_z = (physics.mu1 - physics.mu2) * a_z
     rho = physics.rho2 + (physics.rho1 - physics.rho2) * a
-    # Nondimensional density and its slope w.r.t. a: rho* = 1 + drho_da * a.
-    rho_star = rho / physics.rho_ref
-    drho_da = (physics.rho1 - physics.rho2) / physics.rho_ref
+
+    abs_interface_grad = torch.sqrt(a_x ** 2 + a_y ** 2 + a_z ** 2 + np.finfo(float).eps)
+    # The 2D curvature expression extended term by term, -div(grad(a)/|grad(a)|). Kept in
+    # the same lap/|g| - (g.H.g)/|g|^3 form as 2D (not the algebraically combined one) so
+    # that the eps inside |g| enters identically where grad(a) ~ 0.
+    curvature = -((a_xx + a_yy + a_zz) / abs_interface_grad -
+                  (a_x ** 2 * a_xx + a_y ** 2 * a_yy + a_z ** 2 * a_zz +
+                   2 * a_x * a_y * a_xy + 2 * a_x * a_z * a_xz + 2 * a_y * a_z * a_yz)
+                  / torch.pow(abs_interface_grad, 3))
 
     one_Re = mu / (physics.rho_ref * physics.U_ref * physics.L_ref)
     one_Re_x = mu_x / (physics.rho_ref * physics.U_ref * physics.L_ref)
     one_Re_y = mu_y / (physics.rho_ref * physics.U_ref * physics.L_ref)
     one_Re_z = mu_z / (physics.rho_ref * physics.U_ref * physics.L_ref)
-    # Korteweg coefficient: kappa*rho_ref / (L_ref^2 * U_ref^2) makes kappa*rho*grad(lap(rho))
-    # dimensionless on the same rho_ref*U_ref^2/L_ref scale as every other momentum term.
-    Ko = physics.kappa * physics.rho_ref / (physics.L_ref ** 2 * physics.U_ref ** 2)
+    one_We = physics.sigma / (physics.rho_ref * physics.U_ref ** 2 * physics.L_ref)
     one_Fr = physics.g * physics.L_ref / physics.U_ref ** 2
 
-    # CONTINUITY with mass exchange across the interface. Expanding
-    # d(rho*)/dt + div(rho* u) with rho* = 1 + drho_da * a gives the advective part of a
-    # (which is NOT zero here) plus the compressible part.
-    PDE_m = drho_da * (a_t + u * a_x + v * a_y + w * a_z) + rho_star * div_u
+    PDE_m = u_x + v_y + w_z
+    PDE_a = a_t + u * a_x + v * a_y + w * a_z
+    PDE_u = (u_t + u * u_x + v * u_y + w * u_z) * rho / physics.rho_ref + p_x - \
+            one_We * curvature * a_x - one_Re * (u_xx + u_yy + u_zz) - \
+            2.0 * one_Re_x * u_x - one_Re_y * (u_y + v_x) - one_Re_z * (u_z + w_x)
+    PDE_v = (v_t + u * v_x + v * v_y + w * v_z) * rho / physics.rho_ref + p_y - \
+            one_We * curvature * a_y - one_Re * (v_xx + v_yy + v_zz) - \
+            2.0 * one_Re_y * v_y - one_Re_x * (u_y + v_x) - one_Re_z * (v_z + w_y)
+    # Gravity acts along z (the 2D y), so the body-force term is in the w equation.
+    PDE_w = (w_t + u * w_x + v * w_y + w * w_z) * rho / physics.rho_ref + p_z - \
+            one_We * curvature * a_z - one_Re * (w_xx + w_yy + w_zz) - \
+            rho / physics.rho_ref * one_Fr - 2.0 * one_Re_z * w_z - \
+            one_Re_x * (u_z + w_x) - one_Re_y * (v_z + w_y)
 
-    # Korteweg force per unit volume, grad(lap(rho*)) = drho_da * grad(lap(a)).
-    F_ko_x = Ko * rho_star * drho_da * lap_a_x
-    F_ko_y = Ko * rho_star * drho_da * lap_a_y
-    F_ko_z = Ko * rho_star * drho_da * lap_a_z
-
-    PDE_u = (u_t + u * u_x + v * u_y + w * u_z) * rho_star + p_x - \
-            F_ko_x - one_Re * (u_xx + u_yy + u_zz) - \
-            2.0 * one_Re_x * u_x - one_Re_y * (u_y + v_x) - one_Re_z * (u_z + w_x) + \
-            (2.0 / 3.0) * (one_Re * div_x + one_Re_x * div_u)
-    PDE_v = (v_t + u * v_x + v * v_y + w * v_z) * rho_star + p_y - \
-            F_ko_y - one_Re * (v_xx + v_yy + v_zz) - \
-            2.0 * one_Re_y * v_y - one_Re_x * (u_y + v_x) - one_Re_z * (v_z + w_y) + \
-            (2.0 / 3.0) * (one_Re * div_y + one_Re_y * div_u)
-    # Gravity acts along z, so the body-force term lives in the w-momentum equation.
-    #
-    # FULL GRAVITY, exactly as the 2D script does it.
-    #
-    # An earlier revision used a reduced gravity (rho - rho_mean) here. The argument was
-    # that the domain is triply periodic, so p is periodic, grad(p) has zero volume
-    # average, and a mean body force therefore cannot be balanced -- unless the whole
-    # domain accelerates uniformly, which that revision asserted the data ruled out
-    # ("the domain-mean w is constant in time").
-    #
-    # The current dataset falsifies the premise, not the reasoning: the domain-mean w is
-    # NOT constant, it ramps from 7e-6 to 2.0e-2 cells/step. The measured bulk
-    # acceleration is 1.98e-6 cells/step^2 against a body force of 2.0e-6, i.e.
-    # dw/dt = g to within 1.2%. Nothing removes the mean force; the fluid simply
-    # accelerates, and both phases accelerate together (drop-to-carrier slip is 0.2% of
-    # sqrt(g'D)), which is why the drop barely rises relative to its surroundings.
-    #
-    # That is precisely what the volume mean of this equation asks for with full gravity:
-    # <rho/rho_ref * w_t> balances <rho/rho_ref> * (1/Fr) while <p_z> = 0. Subtracting
-    # rho_mean would instead demand a mean acceleration of zero, which the data
-    # contradicts directly.
-    PDE_w = (w_t + u * w_x + v * w_y + w * w_z) * rho_star + p_z - \
-            F_ko_z - one_Re * (w_xx + w_yy + w_zz) - \
-            rho_star * one_Fr - 2.0 * one_Re_z * w_z - \
-            one_Re_x * (u_z + w_x) - one_Re_y * (v_z + w_y) + \
-            (2.0 / 3.0) * (one_Re * div_z + one_Re_z * div_u)
-
-    return PDE_m, PDE_u, PDE_v, PDE_w
+    return PDE_m, PDE_u, PDE_v, PDE_w, PDE_a
 
 
-def compute_loss(model, physics, data_A, data_PDE, data_GAUGE):
+def compute_loss(model, physics, data_A, data_PDE, data_N, data_EW, data_FB, data_NSEW):
     x_A, y_A, z_A, t_A, a_A = data_A
     x_PDE, y_PDE, z_PDE, t_PDE = data_PDE
-    x_G, y_G, z_G, t_G, p_G = data_GAUGE
+    x_N, y_N, z_N, t_N, p_N = data_N
+    x_E, y_E, z_E, x_W, y_W, z_W, t_EW = data_EW
+    x_F, y_F, z_F, x_B, y_B, z_B, t_FB = data_FB
+    x_NSEW, y_NSEW, z_NSEW, t_NSEW, u_NSEW, v_NSEW, w_NSEW = data_NSEW
 
     f_PDE = torch.zeros_like(x_PDE)
 
@@ -235,42 +189,57 @@ def compute_loss(model, physics, data_A, data_PDE, data_GAUGE):
     _, _, _, _, pred_a_A = model(torch.cat([x_A, y_A, z_A, t_A], dim=1))
     loss_a_A = torch.mean((a_A - pred_a_A) ** 2)
 
-    # Loss GAUGE. The LBPM run sets Domain/BC = 0, so all six faces are periodic; there
-    # are no walls and no pressure outlet. Periodicity is now exact by construction --
-    # the network takes a sin/cos embedding of x, y and z with the domain lengths as
-    # periods (see get_model_dnn(periodic_lengths=...)), which makes every output and
-    # every derivative periodic identically. That replaces the XPER/YPER/ZPER face-pair
-    # mismatch losses this script used to carry, matching the TensorFlow version.
-    #
-    # With every face periodic the pressure is only determined up to an additive
-    # constant, so it is pinned at a single corner point. That is the only BC left.
-    _, _, _, pred_p_G, _ = model(torch.cat([x_G, y_G, z_G, t_G], dim=1))
-    loss_p_GAUGE = torch.mean((p_G - pred_p_G) ** 2)
+    # Loss NSEW (Boundary Conditions)
+    pred_u_NSEW, pred_v_NSEW, pred_w_NSEW, _, _ = model(torch.cat([x_NSEW, y_NSEW, z_NSEW, t_NSEW], dim=1))
+    loss_u_NSEW = torch.mean((u_NSEW - pred_u_NSEW) ** 2)
+    loss_v_NSEW = torch.mean((v_NSEW - pred_v_NSEW) ** 2)
+    loss_w_NSEW = torch.mean((w_NSEW - pred_w_NSEW) ** 2)
 
-    loss_BC = loss_p_GAUGE
+    # Loss N (Pressure at North boundary)
+    _, _, _, pred_p_N, _ = model(torch.cat([x_N, y_N, z_N, t_N], dim=1))
+    loss_p_N = torch.mean((p_N - pred_p_N) ** 2)
+
+    # Loss EW (Periodic Boundary)
+    pred_east = model(torch.cat([x_E, y_E, z_E, t_EW], dim=1))
+    pred_west = model(torch.cat([x_W, y_W, z_W, t_EW], dim=1))
+    loss_u_EW = torch.mean((pred_east[0] - pred_west[0]) ** 2)
+    loss_v_EW = torch.mean((pred_east[1] - pred_west[1]) ** 2)
+    loss_w_EW = torch.mean((pred_east[2] - pred_west[2]) ** 2)
+    loss_p_EW = torch.mean((pred_east[3] - pred_west[3]) ** 2)
+
+    # Loss FB (Periodic Boundary on the y faces, the 3D counterpart of EW)
+    pred_front = model(torch.cat([x_F, y_F, z_F, t_FB], dim=1))
+    pred_back = model(torch.cat([x_B, y_B, z_B, t_FB], dim=1))
+    loss_u_FB = torch.mean((pred_front[0] - pred_back[0]) ** 2)
+    loss_v_FB = torch.mean((pred_front[1] - pred_back[1]) ** 2)
+    loss_w_FB = torch.mean((pred_front[2] - pred_back[2]) ** 2)
+    loss_p_FB = torch.mean((pred_front[3] - pred_back[3]) ** 2)
+
+    loss_BC = loss_u_NSEW + loss_v_NSEW + loss_w_NSEW + loss_p_N + \
+              loss_u_EW + loss_v_EW + loss_w_EW + loss_p_EW + \
+              loss_u_FB + loss_v_FB + loss_w_FB + loss_p_FB
 
     # Loss PDE (Physics-Informed)
-    # Four residuals now, not five: continuity absorbs what used to be the separate
-    # volume-fraction advection equation (see PDE_caller).
-    PDE_m, PDE_u, PDE_v, PDE_w = PDE_caller(model, physics, x_PDE, y_PDE, z_PDE, t_PDE)
+    PDE_m, PDE_u, PDE_v, PDE_w, PDE_a = PDE_caller(model, physics, x_PDE, y_PDE, z_PDE, t_PDE)
     loss_PDE_m = torch.mean((f_PDE - PDE_m) ** 2)
     loss_PDE_u = torch.mean((f_PDE - PDE_u) ** 2)
     loss_PDE_v = torch.mean((f_PDE - PDE_v) ** 2)
     loss_PDE_w = torch.mean((f_PDE - PDE_w) ** 2)
+    loss_PDE_a = torch.mean((f_PDE - PDE_a) ** 2)
 
     loss_PDE = torch.dot(
-        torch.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w]),
+        torch.stack([loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a]),
         physics.loss_weights_PDE,
     )
 
     total_loss = loss_a_A + loss_BC + loss_PDE
 
-    return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w
+    return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a
 
 
-def train_step(model, optimizer, physics, data_A, data_PDE, data_GAUGE):
+def train_step(model, optimizer, physics, batch):
     optimizer.zero_grad()
-    losses = compute_loss(model, physics, data_A, data_PDE, data_GAUGE)
+    losses = compute_loss(model, physics, *batch)
     losses[0].backward()
     optimizer.step()
     return losses
@@ -333,19 +302,24 @@ def to_tensor_tuple(df, columns, device):
 
 
 def build_batch_tensors(batch_dict, device):
-    # The pressure gauge is not batched -- it is a single spatial point over a handful
-    # of times and is fed whole on every step (see data_GAUGE in main()).
     return (
         to_tensor_tuple(batch_dict['A'], batch_dict['A'].columns, device),
         to_tensor_tuple(batch_dict['PDE'], ['x_PDE', 'y_PDE', 'z_PDE', 't_PDE'], device),
+        to_tensor_tuple(batch_dict['N'], batch_dict['N'].columns, device),
+        to_tensor_tuple(batch_dict['EW'], batch_dict['EW'].columns, device),
+        to_tensor_tuple(batch_dict['FB'], batch_dict['FB'].columns, device),
+        to_tensor_tuple(batch_dict['NSEW'], batch_dict['NSEW'].columns, device),
     )
 
 
-def slice_batch(data, prop_batch_sizes, b):
+def slice_batch(data, num_batches, b):
+    """Splits every dataset evenly over num_batches. Fixed ceil-rounded per-key sizes ran
+    the small boundary sets (400 rows at 9 per batch) dry before the last batches, and the
+    mean over an empty slice made loss_BC NaN."""
     batch_dict = {}
     for key, df in data.items():
-        start_idx = b * prop_batch_sizes[key]
-        end_idx = (b + 1) * prop_batch_sizes[key]
+        start_idx = len(df) * b // num_batches
+        end_idx = len(df) * (b + 1) // num_batches
         batch_dict[key] = df.iloc[start_idx:end_idx]
     return batch_dict
 
@@ -378,10 +352,16 @@ def main():
 
     NOP_a = (500, 400)
     NOP_PDE = (400, 2000, 3000)
+    NOP_north = (20, 20)
+    NOP_south = (20, 20)
+    NOP_east = (20, 20)
+    NOP_west = (20, 20)
+    NOP_front_back = (20, 20)
 
     # Generation prints only from rank 0; the rest generate silently.
     with contextlib.redirect_stdout(sys.stdout if is_main else open(os.devnull, "w")):
-        training_data, gauge_df, scales = get_training_data_3d(NOP_a, NOP_PDE)
+        training_data = get_training_data_3d(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east,
+                                             NOP_west, NOP_front_back)
 
     # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
@@ -400,57 +380,39 @@ def main():
     ]
 
     nn_creator = NNCreator(torch.float32)
-    # `periodic_lengths` makes the network periodic in x, y and z by construction,
-    # replacing the face-pair mismatch losses (see compute_loss).
-    net = nn_creator.get_model_dnn(4, hidden_layers, output_layer, activation_functions_dict, False,
-                                   periodic_lengths=scales["period"])
+    net = nn_creator.get_model_dnn(4, hidden_layers, output_layer, activation_functions_dict, False)
+    load_lifted_2d_weights(net, 'initial_weights.h5')
     net.to(device)
-    logger.info(f"Periodic lengths (nondimensional): {scales['period']}")
+    logger.info("Loaded initial_weights.h5 (the 2D starting point) lifted to 3D: "
+                "u3(x,y,z,t) = u2(x,z,t), w3 = v2, p3 = p2, a3 = a2, v3 = 0")
 
     if is_distributed:
         model = DDP(net, device_ids=[local_rank] if torch.cuda.is_available() else None)
     else:
         model = net
 
-    logger.info("Starting from a freshly initialized network -- no PyTorch-format pretrained "
-                "weights exist yet for the 3D case (initial_weights_3d.h5 is a Keras checkpoint "
-                "and isn't portable to this architecture).")
-
-    # Physical parameters of the LBPM run (t14_forced_sphere.db), together with the
-    # reference scales measured from the dataset. These replace the 2D Hysing benchmark
-    # values, which were SI quantities for a light bubble in water and had no
-    # correspondence to this lattice-unit run of a dense drop in gas.
-    mu = scales["mu"]            # [drop, carrier] dynamic viscosity = rho * nu
-    kappa = scales["kappa"]      # Color/pr_kappa: the Korteweg coefficient, straight from the .db
-    g = scales["g"]              # Color/F = 0,0,+2e-6, per unit mass, along +z
-    rho = scales["rho"]          # [rhoA drop, rhoB carrier]
-    u_ref = scales["U_ref"]
-    L_ref = scales["L_ref"]
-    logger.info(f"Reference scales: L_ref={L_ref:.4f} cells, U_ref={u_ref:.6g} cells/step, "
-                f"T_ref={scales['T_ref']:.1f} steps")
-    logger.info(f"mu={mu}, rho={rho}, kappa={kappa}, g={g}, rho_mean={scales['rho_mean']:.5f}")
-    logger.info(f"Ko = {kappa * rho[1] / (L_ref ** 2 * u_ref ** 2):.4f} "
-                f"(measured sigma {scales['sigma']:.4g} is diagnostic only now)")
-    # [continuity, u, v, w] -- the volume-fraction advection residual is gone.
-    loss_weights_PDE = [1.0, 10.0, 10.0, 10.0]
+    # Physical parameters of the 2D Hysing benchmark, as in rising_bubble_train.py
+    mu = [1.0, 10.0]
+    sigma = 24.5
+    g = -0.98
+    rho = [100, 1000]
+    u_ref = 1.0
+    L_ref = 0.25
+    loss_weights_PDE = [1.0, 10.0, 10.0, 10.0, 1.0]
     physics = Physics(
-        mu1=mu[0], mu2=mu[1], kappa=kappa, g=g, rho1=rho[0], rho2=rho[1],
+        mu1=mu[0], mu2=mu[1], sigma=sigma, g=g, rho1=rho[0], rho2=rho[1],
         U_ref=u_ref, L_ref=L_ref, rho_ref=rho[1],
         loss_weights_PDE=torch.tensor(loss_weights_PDE, dtype=torch.float32, device=device),
     )
-
-    # Fed whole on every step rather than batched -- a proportional batch would round the
-    # 40-row gauge down to one or two rows and make it unreliably sampled.
-    data_GAUGE = to_tensor_tuple(gauge_df, gauge_df.columns, device)
 
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
     checkpoint_interval = 10
     # Batches per epoch across ALL ranks, rounded up to a multiple of world_size so every
     # rank takes the same number of steps (unequal counts deadlock DDP's all-reduce). The
-    # per-GPU batch therefore stays ~1/20 of the data; the effective batch per optimizer
+    # per-GPU batch therefore stays ~1/50 of the data; the effective batch per optimizer
     # step is world_size times that.
-    num_of_batches = math.ceil(20 / world_size) * world_size
+    num_of_batches = math.ceil(50 / world_size) * world_size
 
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches)
@@ -458,7 +420,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rates[0], eps=1e-8)
 
     start_total = time.time()
-    history_loss_a, history_loss_f_uvw, history_loss_f_m = [], [], []
+    history_loss_a, history_loss_f_uvw, history_loss_f_ma = [], [], []
     current_best_total_loss = float('inf')
 
     num_batches, prop_batch_sizes = None, None
@@ -485,10 +447,11 @@ def main():
                              for key, df in training_data.items()}
 
             # No skipping of empty batches here: a rank that skips a step deadlocks the rest.
+            # slice_batch splits every set evenly, so no batch is empty anyway.
             for k in range(num_local_batches):
-                batch_dict = slice_batch(shuffled_data, prop_batch_sizes, rank + k * world_size)
-                data_A, data_PDE = build_batch_tensors(batch_dict, device)
-                losses = train_step(model, optimizer, physics, data_A, data_PDE, data_GAUGE)
+                batch_dict = slice_batch(shuffled_data, num_batches, rank + k * world_size)
+                batch = build_batch_tensors(batch_dict, device)
+                losses = train_step(model, optimizer, physics, batch)
                 epoch_losses.append([l.item() for l in losses])
 
             # Summed over batches (not averaged) to match rising_bubble_train.py. Each rank
@@ -497,11 +460,11 @@ def main():
             sum_losses = torch.tensor(np.sum(epoch_losses, axis=0), dtype=torch.float64, device=device)
             if is_distributed:
                 dist.all_reduce(sum_losses, op=dist.ReduceOp.SUM)
-            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w = sum_losses.tolist()
+            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_losses.tolist()
 
             history_loss_a.append(loss_a)
             history_loss_f_uvw.append(loss_u + loss_v + loss_w)
-            history_loss_f_m.append(loss_m)
+            history_loss_f_ma.append(loss_m + loss_pde_a)
 
             if epoch % checkpoint_interval == 0:
                 current_time = time.time()
@@ -509,7 +472,7 @@ def main():
                 start_checkpoint_time = current_time
                 log_msg = f"Epoch: {epoch}/{epochs} - Time: {time_for_epoch:.2f}s - Loss: {total_loss:.4e}"
                 log_msg += f" | a: {loss_a:.4e}, BC: {loss_bc:.4e}, m: {loss_m:.4e}"
-                log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, w: {loss_w:.4e}"
+                log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, w: {loss_w:.4e}, pde_a: {loss_pde_a:.4e}"
                 logger.info(log_msg)
 
             if is_main and epoch % checkpoint_interval == 0 and total_loss < current_best_total_loss:
@@ -547,28 +510,29 @@ def main():
         underlying_net.eval()
         final_evaluation_losses = []
         for b in range(num_batches):
-            batch_dict = slice_batch(training_data, prop_batch_sizes, b)
+            batch_dict = slice_batch(training_data, num_batches, b)
             if all(batch.empty for batch in batch_dict.values()):
                 continue
 
-            data_A, data_PDE = build_batch_tensors(batch_dict, device)
+            batch = build_batch_tensors(batch_dict, device)
             # Not wrapped in torch.no_grad(): the PDE residual needs first/second
             # derivatives of the network output w.r.t. its inputs, which requires
             # autograd to be active even though we never call .backward() here.
-            batch_losses = compute_loss(underlying_net, physics, data_A, data_PDE, data_GAUGE)
+            batch_losses = compute_loss(underlying_net, physics, *batch)
             final_evaluation_losses.append([l.item() for l in batch_losses])
 
         # Summed over batches to match rising_bubble_train.py.
         sum_final_losses = np.sum(final_evaluation_losses, axis=0)
-        _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w = sum_final_losses
+        _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_final_losses
 
         logger.info("--- Final Loss Breakdown ---")
         logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")
         logger.info(f"MSE_BC                     : {loss_bc:.4e}")
-        logger.info(f"MSE_f,m (continuity)       : {loss_m:.4e}")
+        logger.info(f"MSE_f,m                    : {loss_m:.4e}")
         logger.info(f"MSE_f,u                    : {loss_u:.4e}")
         logger.info(f"MSE_f,v                    : {loss_v:.4e}")
         logger.info(f"MSE_f,w                    : {loss_w:.4e}")
+        logger.info(f"MSE_f,a                    : {loss_pde_a:.4e}")
         logger.info("----------------------------\n")
 
         logger.info("Generating and saving loss history plots...")
@@ -594,13 +558,13 @@ def main():
         plt.savefig(os.path.join(dirname, 'loss_history_momentum_uvw.png'))
 
         plt.figure(figsize=(10, 6))
-        plt.plot(epochs_range, history_loss_f_m)
-        plt.title(f'MSE of Continuity vs. Epochs ({adaptive_mode} - {activation_choice})')
+        plt.plot(epochs_range, history_loss_f_ma)
+        plt.title(f'MSE of Conservation (m,a) vs. Epochs ({adaptive_mode} - {activation_choice})')
         plt.xlabel('Epoch')
-        plt.ylabel('MSE Loss (f_m)')
+        plt.ylabel('MSE Loss (f_m + f_a)')
         plt.yscale('log')
         plt.grid(True, which="both", ls="--")
-        plt.savefig(os.path.join(dirname, 'loss_history_continuity.png'))
+        plt.savefig(os.path.join(dirname, 'loss_history_conservation_ma.png'))
 
         plt.close('all')
         logger.info("Plots saved successfully.")
@@ -611,7 +575,7 @@ def main():
             'epoch': epochs_range,
             'MSE_alpha': history_loss_a,
             'MSE_f_uvw': history_loss_f_uvw,
-            'MSE_f_m': history_loss_f_m,
+            'MSE_f_ma': history_loss_f_ma,
         })
         history_df.to_csv(history_filepath, index=False)
         logger.info(f"Loss history data saved to: {history_filepath}")

@@ -1,8 +1,8 @@
+import math
 import numpy as np
 import pandas as pd
 import h5py
 
-from generate_points_3d import compute_normals_3d, get_points_pde_3d
 
 ''' Training-point generator for the Peng-Robinson (eos_type = "cp") PINN,
 pytorch_3d_pr_train.py. Same LBPM run family as generate_points_3d.py, but it reads the
@@ -43,6 +43,145 @@ which is why the training script can learn g(t) instead.
 Grid conventions (levelset raw -8 = drop, +8 = carrier; fields stored (time, Z, Y, X);
 per-axis [0, 1] h5 normalisation undone to cubic lattice cells; fully periodic) are as in
 generate_points_3d.py. '''
+
+
+# Point-sampling helpers, frozen from generate_points_3d.py as of 703d53e. That module
+# has since become the Hysing 2D-in-3D generator (absolute refinement widths, a single
+# cell_size), which is wrong for the LBPM lattice-unit data this module reads.
+
+
+def get_points_for_interface_3d(NOP, t_value, interface, normal, tangent1, tangent2,
+                                 cell_size, refine_start, refine_end):
+    ''' 3D analogue of generate_points.get_points_for_interface. Samples points along
+    the interface normal (inward = drop side, outward = carrier side), staggered
+    across a small stencil of tangential offsets (built from tangent1/tangent2) so that
+    points are spread across the interface surface between grid nodes, not just at the
+    interface nodes themselves.
+
+    A 3D interface carries ~12700 cells per snapshot against the few hundred points
+    actually wanted, so a random subset of interface cells is drawn up front instead
+    of building ~127k candidates and throwing almost all of them away. '''
+
+    stencil = np.array([(0.0, 0.0), (1 / 3, 0.0), (2 / 3, 0.0), (0.0, 1 / 3), (0.0, 2 / 3)])
+
+    n_cells_needed = max(1, math.ceil(NOP / (2 * len(stencil))))
+    if len(interface) > n_cells_needed:
+        pick = np.random.choice(len(interface), n_cells_needed, replace=False)
+        interface, normal = interface[pick], normal[pick]
+        tangent1, tangent2 = tangent1[pick], tangent2[pick]
+
+    # (cells, stencil, 3) tangential offsets around each interface cell
+    offsets = (cell_size * stencil[None, :, 0, None] * tangent1[:, None, :] +
+               cell_size * stencil[None, :, 1, None] * tangent2[:, None, :])
+    base = interface[:, None, :] + offsets
+    n = normal[:, None, :]
+
+    shape = base.shape[:2] + (1,)
+    inward = base + np.random.uniform(refine_start, refine_end, shape) * n
+    outward = base - np.random.uniform(refine_start, refine_end, shape) * n
+
+    inward = inward.reshape(-1, 3)
+    outward = outward.reshape(-1, 3)
+    interface_inward = np.hstack([inward, t_value * np.ones((len(inward), 1)),
+                                  np.ones((len(inward), 1))])
+    interface_outward = np.hstack([outward, t_value * np.ones((len(outward), 1)),
+                                   np.zeros((len(outward), 1))])
+    interface_data = np.vstack([interface_inward, interface_outward])
+    indices_to_keep = np.random.choice(len(interface_data), NOP, replace=False)
+    return interface_data[indices_to_keep, :]
+
+
+def get_points_for_domain_3d(NOP, t_value, X, Y, Z, levelset, max_levelset):
+    ''' 3D analogue of generate_points.get_points_for_domain, sampling points far from
+    the interface (|levelset| >= max_levelset).
+
+    The 2D routine stratifies by x column so every column is represented. That is not
+    reachable in 3D -- there are 8100 (x, y) columns against a few hundred to a few
+    thousand requested points -- so this draws a uniform random sample over the whole
+    grid by rejection instead. '''
+
+    kept = []
+    n_kept = 0
+    while n_kept < NOP:
+        draw = max(NOP - n_kept, 1024)
+        iz = np.random.randint(0, len(Z), draw)
+        iy = np.random.randint(0, len(Y), draw)
+        ix = np.random.randint(0, len(X), draw)
+        vals = levelset[iz, iy, ix]
+        keep = (np.abs(vals) >= max_levelset) | (np.abs(vals) == 8)
+        iz, iy, ix, vals = iz[keep], iy[keep], ix[keep], vals[keep]
+        kept.append(np.column_stack([X[ix], Y[iy], Z[iz],
+                                     t_value * np.ones(len(ix)),
+                                     (vals > 0).astype(float)]))
+        n_kept += len(ix)
+    return np.vstack(kept)[:NOP, :]
+
+
+def get_points_pde_3d(NOP, times, X, Y, Z, cell_size, interface_all, normal_all,
+                       tangent1_all, tangent2_all, levelset_all):
+    ''' Generates the residual (collocation) points for the PDEs (3D). '''
+
+    # Offsets in CELLS, see the note in get_points_a_3d. The 2D literals 0.001 and 0.1
+    # were 0.26 cells and 25.6 cells, the latter being 0.4 * L_ref; the nearfield band is
+    # kept at 0.4 * L_ref here (L_ref ~ 28.8 cells) so it scales with the drop, not the grid.
+    refine_interface_start = 0.0
+    refine_interface_end = 0.25 * cell_size
+    refine_nearfield_end = 12.0 * cell_size
+    domain_start_levelset = 4
+    data = np.empty((0, 5), float)
+    for t_value, interface, normal, t1, t2, levelset in zip(
+            times, interface_all, normal_all, tangent1_all, tangent2_all, levelset_all):
+        interface_temp = get_points_for_interface_3d(NOP[0], t_value, interface, normal, t1, t2,
+                                                       cell_size, refine_interface_start, refine_interface_end)
+        nearfield_temp = get_points_for_interface_3d(NOP[1], t_value, interface, normal, t1, t2,
+                                                       cell_size, refine_interface_end, refine_nearfield_end)
+        domain_temp = get_points_for_domain_3d(NOP[2], t_value, X, Y, Z, levelset, domain_start_levelset)
+        data = np.vstack([data, interface_temp, nearfield_temp, domain_temp])
+    data[:, 4] = 0.0
+    return data
+
+
+def compute_normals_3d(X, Y, Z, levelset, dx, dy, dz):
+    ''' 3D analogue of generate_points.compute_normals. For each interface cell
+    (|levelset| <= 0.75) computes the surface normal from the levelset gradient and
+    two tangent vectors spanning the tangent plane (via Gram-Schmidt against a helper
+    axis), which are used to distribute interface/nearfield refinement points. '''
+
+    interface, normal, tangent1, tangent2 = [], [], [], []
+
+    for snap in levelset:
+        nz, ny, nx = snap.shape
+        idx_z, idx_y, idx_x = np.where(np.abs(snap) <= 0.75)
+
+        valid = ((idx_x > 0) & (idx_x < nx - 1) &
+                 (idx_y > 0) & (idx_y < ny - 1) &
+                 (idx_z > 0) & (idx_z < nz - 1))
+        idx_x, idx_y, idx_z = idx_x[valid], idx_y[valid], idx_z[valid]
+
+        gx = (snap[idx_z, idx_y, idx_x + 1] - snap[idx_z, idx_y, idx_x - 1]) / (2 * dx)
+        gy = (snap[idx_z, idx_y + 1, idx_x] - snap[idx_z, idx_y - 1, idx_x]) / (2 * dy)
+        gz = (snap[idx_z + 1, idx_y, idx_x] - snap[idx_z - 1, idx_y, idx_x]) / (2 * dz)
+
+        grad_abs = np.sqrt(gx ** 2 + gy ** 2 + gz ** 2)
+        grad_abs = np.where(grad_abs == 0, np.finfo(float).eps, grad_abs)
+        n = np.stack([gx, gy, gz], axis=1) / grad_abs[:, None]
+
+        helper = np.tile(np.array([0.0, 0.0, 1.0]), (len(n), 1))
+        near_parallel = np.abs(n[:, 2]) > 0.9
+        helper[near_parallel] = np.array([1.0, 0.0, 0.0])
+
+        t1 = np.cross(n, helper)
+        t1 = t1 / np.linalg.norm(t1, axis=1, keepdims=True)
+        t2 = np.cross(n, t1)
+
+        pts = np.stack([X[idx_x], Y[idx_y], Z[idx_z]], axis=1)
+
+        interface.append(pts)
+        normal.append(n)
+        tangent1.append(t1)
+        tangent2.append(t2)
+
+    return interface, normal, tangent1, tangent2
 
 
 # Physical parameters of the LBPM run, from t14_forced_sphere.db. KEEP IN SYNC BY HAND --
