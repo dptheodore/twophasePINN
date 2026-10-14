@@ -1,7 +1,11 @@
-# the repo root ignores *.sh; keep the launcher
+# the repo root ignores *.sh; keep the launchers
 !run.sh
+!setup_spark.sh
+!spark_run.sh
 # build products and run output
 rising3d_mpi
 rising3d_serial
 _rising3d.c
 run_L*/
+run_smoke/
+hosts.spark
