@@ -24,7 +24,7 @@ from pytorch_utilities import NNCreator
 
 ''' Peng-Robinson counterpart of pytorch_3d_rising_bubble_train.py.
 
-Inputs (x, y, z, t); outputs (u, v, w, rho, p, a). Density is now a network output
+Inputs (x, y, z, t); outputs (u, v, w, rho, a). Density is now a network output
 supervised directly from the h5, instead of being reconstructed from a volume fraction
 as rho2 + (rho1 - rho2) * a. That matters for a single-component Peng-Robinson fluid: rho
 is THE state variable, the interface is a smooth density profile set by kappa, and the
@@ -34,15 +34,22 @@ Residuals, all nondimensional (see generate_points_3d_pr for the derivation from
 
   continuity  rho_t + u . grad(rho) + rho div(u) = 0
   momentum    rho Du/Dt = -Eu grad(p) + (Ko rho + Kb) grad(lap(rho)) + div(tau) + rho g(t)/Fr
-  EOS         p = P_PR(rho) / p_scale
+
+with p = P_PR(rho) / p_scale substituted exactly, not learned.
 
 Eu = k^2 p_scale / (rho_ref U_ref^2) carries LBPM's k-transformation factor. Kb =
 LATTICE_BETA / (L_ref U_ref)^2 is the rho-independent Korteweg-like term the CFD obeys on
 top of kappa (see generate_points_3d_pr); without it the CFD's own rho profile is not a
-solution and the network trades rho accuracy for momentum loss. The EOS
-residual holds p to the thermodynamic pressure, which also fixes its gauge -- no pressure
-gauge point is needed any more. a takes no part in the physics: it is a supervised phase
-indicator kept for interface tracking and post-processing.
+solution and the network trades rho accuracy for momentum loss. a takes no part in the
+physics: it is a supervised phase indicator kept for interface tracking and post-processing.
+
+Why p is not a network output (it was until 2026-10-14, held to P_PR(rho) by a soft EOS
+residual): at the interface Eu grad(p) and the Korteweg term are each ~33 and cancel to ~1%
+on the CFD. With p free the network kept p nearly flat, paid ~0.02 of EOS loss, and smoothed
+rho to half the drop density so the Korteweg term had nothing to balance (run
+pr_Oct-13-2026_21-24-25: momentum ~4e-6 with its own p, ~13 in the band with
+p = P_PR(rho_net), against ~0.16 for the CFD truth). The h5 pressure is P_PR(density) to
+2e-8, so the identity is imposed exactly and the decoupled escape no longer exists.
 
 Viscous stress tau = mu (grad u + grad u^T) + BULK_LAMBDA mu div(u) I with mu = rho nu.
 BULK_LAMBDA = 0 is the lattice-Boltzmann stress (bulk viscosity 2 mu / 3); -2/3 would be
@@ -75,14 +82,14 @@ SUPERVISED = ("rho", "u", "v", "w") if GRAVITY_MODE == "learned" else ("rho",)
 Physics = namedtuple(
     "Physics",
     ["one_Re", "Eu", "Ko", "Kb", "U_ref", "L_ref", "rho_ref", "p_scale",
-     "drho_star", "loss_weights_PDE", "loss_weight_EOS", "loss_weights_DATA"],
+     "drho_star", "loss_weights_PDE", "loss_weights_DATA"],
 )
 
 
 class PINN(torch.nn.Module):
     """The field network plus the body force g(t), so that DDP sees (and syncs) the
     learned force's parameters like any other weight. forward() returns
-    (u, v, w, rho, p, a, g_star), g_star = g(t) L_ref / U_ref^2."""
+    (u, v, w, rho, a, g_star), g_star = g(t) L_ref / U_ref^2."""
 
     def __init__(self, net, mode, t_knots, T_ref, t_origin, L_ref, U_ref):
         super().__init__()
@@ -131,8 +138,13 @@ def grad(f, x):
     return torch.autograd.grad(f, x, torch.ones_like(f), create_graph=True)[0]
 
 
+def pressure_star(rho, physics):
+    """p* = P_PR(rho) / p_scale, rho nondimensional."""
+    return pr.pressure_pr(rho * physics.rho_ref) / physics.p_scale
+
+
 def PDE_caller(model, physics, x, y, z, t):
-    """Residuals of continuity, the three momentum components, and the EOS.
+    """Residuals of continuity and the three momentum components.
 
     `model` is called directly (not through a `self.forward` alias) so that this works
     whether `model` is the raw net or its DDP wrapper.
@@ -143,7 +155,8 @@ def PDE_caller(model, physics, x, y, z, t):
     t = t.requires_grad_(True)
     X = (x, y, z)
 
-    u, v, w, rho, p, _, gz = model(torch.cat([x, y, z, t], dim=1))
+    u, v, w, rho, _, gz = model(torch.cat([x, y, z, t], dim=1))
+    p = pressure_star(rho, physics)
     vel = (u, v, w)
 
     # First derivatives: dvel[i][j] = d vel_i / d x_j.
@@ -178,9 +191,7 @@ def PDE_caller(model, physics, x, y, z, t):
             res = res - rho * gz
         PDE_mom.append(res)
 
-    PDE_eos = p - pr.pressure_pr(rho * physics.rho_ref) / physics.p_scale
-
-    return PDE_m, PDE_mom[0], PDE_mom[1], PDE_mom[2], PDE_eos
+    return PDE_m, PDE_mom[0], PDE_mom[1], PDE_mom[2]
 
 
 def compute_loss(model, physics, data_DATA, data_PDE):
@@ -190,8 +201,8 @@ def compute_loss(model, physics, data_DATA, data_PDE):
 
     # DATA LOSSES. rho is compared in units of the liquid-gas density jump so its loss is
     # on the same O(1) footing as a's; velocities and p are already O(1) in u*, p*.
-    u, v, w, rho, p, a, _ = model(torch.cat([x_D, y_D, z_D, t_D], dim=1))
-    pred = dict(rho=rho, u=u, v=v, w=w, p=p)
+    u, v, w, rho, a, _ = model(torch.cat([x_D, y_D, z_D, t_D], dim=1))
+    pred = dict(rho=rho, u=u, v=v, w=w, p=pressure_star(rho, physics))
     loss_a = torch.mean((a_D - a) ** 2)
     loss_fields = []
     for name, target in zip(SUPERVISED, targets):
@@ -202,22 +213,20 @@ def compute_loss(model, physics, data_DATA, data_PDE):
     loss_data = loss_a + torch.dot(torch.stack(loss_fields), physics.loss_weights_DATA)
 
     x_P, y_P, z_P, t_P = data_PDE
-    PDE_m, PDE_u, PDE_v, PDE_w, PDE_eos = PDE_caller(model, physics, x_P, y_P, z_P, t_P)
+    PDE_m, PDE_u, PDE_v, PDE_w = PDE_caller(model, physics, x_P, y_P, z_P, t_P)
     loss_m = torch.mean(PDE_m ** 2)
     loss_u = torch.mean(PDE_u ** 2)
     loss_v = torch.mean(PDE_v ** 2)
     loss_w = torch.mean(PDE_w ** 2)
-    loss_eos = torch.mean(PDE_eos ** 2)
 
-    loss_PDE = torch.dot(torch.stack([loss_m, loss_u, loss_v, loss_w]), physics.loss_weights_PDE) + \
-        physics.loss_weight_EOS * loss_eos
+    loss_PDE = torch.dot(torch.stack([loss_m, loss_u, loss_v, loss_w]), physics.loss_weights_PDE)
 
     total_loss = loss_data + loss_PDE
-    return (total_loss, loss_a, *loss_fields, loss_m, loss_u, loss_v, loss_w, loss_eos)
+    return (total_loss, loss_a, *loss_fields, loss_m, loss_u, loss_v, loss_w)
 
 
 def loss_names():
-    return ["total", "a"] + list(SUPERVISED) + ["m", "u_mom", "v_mom", "w_mom", "eos"]
+    return ["total", "a"] + list(SUPERVISED) + ["m", "u_mom", "v_mom", "w_mom"]
 
 
 def train_step(model, optimizer, physics, data_DATA, data_PDE):
@@ -365,12 +374,11 @@ def main():
     activation_functions = {activation_choice: range(1, no_layers + 1)}
     activation_functions_dict = build_activation_dict(hidden_layers, activation_functions, adaptive_activation_n)
 
-    # rho* = exp(.) keeps density positive, so P_PR stays on its physical branch; p* is
-    # linear because P_PR goes negative inside
-    # the interface (down to -0.84 p_scale in the data).
+    # rho* = exp(.) keeps density positive, so P_PR stays on its physical branch. No p
+    # output: p* = P_PR(rho) / p_scale (see the module docstring).
     output_layer = [
         ("output_u", None), ("output_v", None), ("output_w", None),
-        ("output_rho", "exponential"), ("output_p", None), ("output_a", "sigmoid"),
+        ("output_rho", "exponential"), ("output_a", "sigmoid"),
     ]
 
     nn_creator = NNCreator(torch.float32)
@@ -398,13 +406,11 @@ def main():
     # dominated by the Eu grad(p) / Ko grad(lap(rho)) balance, so if the momentum losses
     # swamp everything else, these are the first knobs to turn.
     loss_weights_PDE = [1.0, 10.0, 10.0, 10.0]
-    loss_weight_EOS = 1.0
     loss_weights_DATA = [1.0] * len(SUPERVISED)
     physics = Physics(
         one_Re=one_Re, Eu=Eu, Ko=Ko, Kb=Kb, U_ref=U_ref, L_ref=L_ref, rho_ref=rho_ref, p_scale=p_scale,
         drho_star=(pr.RHO_LIQ - pr.RHO_GAS) / rho_ref,
         loss_weights_PDE=torch.tensor(loss_weights_PDE, dtype=torch.float32, device=device),
-        loss_weight_EOS=loss_weight_EOS,
         loss_weights_DATA=torch.tensor(loss_weights_DATA, dtype=torch.float32, device=device),
     )
 

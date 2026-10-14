@@ -23,7 +23,7 @@ The +(1/3) grad(rho) cancels the LBM's own ideal-gas pressure, and Gibbs-Duhem
 beta (LATTICE_BETA) is not in the continuum model above; it is measured from the data.
 Checked against lbpm_bubble_dataset_newrun_nowrap.h5 (diagnose_rho_residuals.py):
   - The h5 pressure IS P_PR(density) to 2e-8, so p is not independent of rho. The
-    training script keeps p as an output but ties it to rho through an EOS residual.
+    training script substitutes p = P_PR(rho) exactly rather than learning p.
   - At the interface the CFD satisfies k^2 grad(P_PR) = (kappa rho + beta) grad(lap(rho))
     with beta = 0.085 ~= 1/12 (lattice units) to 2%; without beta the two sides differ by
     2.3x and the trainer's momentum residual on the TRUTH is ~1.5e4 per point, which the
