@@ -1,0 +1,7 @@
+# the repo root ignores *.sh; keep the launcher
+!run.sh
+# build products and run output
+rising3d_mpi
+rising3d_serial
+_rising3d.c
+run_L*/

@@ -4,8 +4,10 @@ import pandas as pd
 import h5py
 
 ''' 3D counterpart of generate_points.py, kept equivalent to it in every respect except
-the added dimension. It reads "rising_bubble_3d.h5" (written by revolve_2d_to_3d.py from
-the 2D "rising_bubble.h5": the 2D bubble revolved about its vertical axis into a sphere)
+the added dimension. It reads H5_PATH: either "rising_bubble_3d.h5" (written by
+revolve_2d_to_3d.py from the 2D "rising_bubble.h5": the 2D bubble revolved about its
+vertical axis into a sphere, levelset only) or "rising_bubble_3d_basilisk.h5" (a real 3D
+Basilisk simulation of the same case, cfd/basilisk_rising_bubble_3d, via basilisk_to_h5.py)
 and produces the same training-point dataframes as get_training_data, extended with a
 z coordinate and a w velocity.
 
@@ -25,6 +27,10 @@ Space and time are nondimensionalised by L_ref = 0.25 (U_ref = 1), as in 2D. '''
 
 H5_PATH = "../cfd_data/rising_bubble_3d.h5"
 L_REF = 0.25
+# The 2D selection, indices [0, 15] + [30:100:5] + [100::5] + [1, 2] of the 0.02-spaced
+# snapshots, as times: 0, 0.02, 0.04, 0.3, then every 0.1 from 0.6 to 3.0.
+TRAIN_TIMES = np.round(np.arange(151)[np.sort(np.concatenate(
+    [np.arange(0, 30, 15), np.arange(30, 100, 5), np.arange(100, 151, 5), [1, 2]]))] * 0.02, 2)
 
 
 def get_points_for_interface_3d(NOP, t_value, interface, normal, tangent1, tangent2,
@@ -272,10 +278,13 @@ def get_training_data_3d(NOP_A, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_wes
         Z = np.array(data["Z"], dtype=float)
         times = np.array(data["time"])
 
-        # TIME SNAPSHOT SELECTION (identical to 2D). Read only the selected snapshots --
-        # the full 3D levelset (~20 GB) does not need to be in memory.
-        indices = np.arange(len(times))
-        indices = np.sort(np.concatenate([indices[0:30:15], indices[30:100:5], indices[100::5], indices[1:3]], axis=0))
+        # TIME SNAPSHOT SELECTION (identical to 2D). Selected by time value, not position,
+        # so files holding only these snapshots (rising_bubble_3d_basilisk.h5: 29 training
+        # + 10 validation times) give the same set as the full 151-snapshot one. Read only
+        # the selected snapshots -- the full 3D levelset (~20 GB) does not need to be in memory.
+        indices = np.array([np.argmin(np.abs(times - t)) for t in TRAIN_TIMES])
+        off = np.abs(times[indices] - TRAIN_TIMES)
+        assert off.max() < 0.005, f"no snapshot near t = {TRAIN_TIMES[off.argmax()]}"
         times = times[indices]
         levelset = -np.array(data["levelset"][indices])
 
