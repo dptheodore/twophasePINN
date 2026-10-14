@@ -16,6 +16,11 @@ rising3d_serial: rising3d.c
 	$(QCC) $(CFLAGS) rising3d.c -o $@ -lm
 
 clean:
-	rm -f rising3d_mpi rising3d_serial _rising3d.c
+	rm -f rising3d_mpi rising3d_serial rising3d_walls_mpi _rising3d.c
 
 .PHONY: all clean
+
+# Benchmark-validation build: no-slip on all six faces (Adelsberger et al. 2014).
+# mpirun -np 16 ./rising3d_walls_mpi 7 run_walls_L7 && python check_run.py run_walls_L7/log.txt
+rising3d_walls_mpi: rising3d.c
+	CC99='mpicc -std=c99' $(QCC) $(CFLAGS) -D_MPI=1 -DWALLS=1 rising3d.c -o $@ -lm

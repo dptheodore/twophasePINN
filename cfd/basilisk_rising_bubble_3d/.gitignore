@@ -9,3 +9,5 @@ _rising3d.c
 run_L*/
 run_smoke/
 hosts.spark
+rising3d_walls_mpi
+run_walls_L*/

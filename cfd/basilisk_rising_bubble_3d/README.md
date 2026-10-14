@@ -28,6 +28,28 @@ GPUs: not supported for this case. Basilisk's GPU grids are single-GPU, its
 surface-tension curvature does not run on them, and the GPU alternative (CLSVOF +
 integral tension) failed in 3D. See the comment at the top of `rising3d.c`.
 
+## Validation
+
+Run in benchmark mode (`make rising3d_walls_mpi`: no-slip on all six faces, the setup
+of Adelsberger et al. 2014, test case 1), the solver reproduces the published numbers
+already at LEVEL 6 (dx = 1/64):
+
+| | LEVEL 6, walls | benchmark | LEVEL 6, periodic (this case) |
+|---|---|---|---|
+| max rise velocity | 0.3585 at t = 0.89 | 0.352-0.358 at t ~ 0.9 | 0.392 at t = 0.99 |
+| rise velocity, t = 3 | 0.348 | 0.33-0.35 | 0.383 |
+| diameters, t = 3 (horiz. / vert.) | 0.56 / 0.375 | ~0.58 / 0.355-0.37 | 0.59 / 0.34 |
+| sphericity, t = 3 | 0.958 | 0.955-0.96 | 0.938 |
+| volume drift | -0.03% | | -0.04% |
+
+The periodic case (the 2D paper's boundary conditions, used for the training data) rises
+about 9% faster and flattens more, because no side walls hold it back. That difference
+comes from the boundary conditions, not the resolution: the periodic rise velocity is
+0.392 / 0.392 / 0.388 at LEVEL 5 / 6 / 7. Diameters are quantised to one cell (1/64
+at LEVEL 6).
+
+Check any run with `python check_run.py run_L8/log.txt ../../cfd_data/rising_bubble_3d_basilisk_L8.h5`.
+
 ## Install (Linux)
 
 ```bash
@@ -66,17 +88,22 @@ Then launch from Spark A. This needs passwordless ssh to B and the repo at the s
 on both:
 
 ```bash
-SPARK_B=<spark-b-hostname> cfd/basilisk_rising_bubble_3d/spark_run.sh            # parallel
-SPARK_B=<spark-b-hostname> cfd/basilisk_rising_bubble_3d/spark_run.sh cluster    # one run, both Sparks
+SPARK_B=<spark-b-hostname> cfd/basilisk_rising_bubble_3d/spark_run.sh             # cluster (default)
+SPARK_B=<spark-b-hostname> cfd/basilisk_rising_bubble_3d/spark_run.sh parallel
 ```
 
-- `parallel` (default) runs LEVEL 8 on A, which is the training data, and LEVEL 7 on B,
-  which is the grid-convergence check. Each uses 16 ranks on 20 cores.
-- `cluster` runs a single LEVEL 8 job across both Sparks with 128 ranks, 64 per Spark.
-  Basilisk cannot mix MPI with OpenMP, and this domain only splits into 2, 16 or 128 ranks,
-  so this is the only way to put both machines on one run. It is about 3x oversubscribed
-  and may or may not beat `parallel`: compare the step rate in `run_L8/log.txt` after
-  10 minutes. If OpenMPI picks the wrong network, set `MPI_IFACE=<ConnectX interface>`.
+- `cluster` (default) runs a single LEVEL 8 job across both Sparks, 128 ranks, 64 per
+  Spark. Basilisk cannot mix MPI with OpenMP, and this domain only splits into 2, 16 or
+  128 ranks, so this is the only way to put both machines on one run. It is about 3x
+  oversubscribed.
+  - **Validation gate:** before LEVEL 8, it runs the benchmark-mode validation
+    (`rising3d_walls_mpi`, LEVEL 6) on the same 128 ranks, hostfile and network settings,
+    and checks it with `check_run.py --strict`. LEVEL 8 starts only if the peak rise
+    velocity is within 0.345-0.365 at t = 0.8-1.0 and the volume drifts by less than 0.5%.
+  - Follow it in `run_cluster.log`, then `run_L8/log.txt`.
+  - If OpenMPI picks the wrong network, set `MPI_IFACE=<ConnectX interface>`.
+- `parallel` runs LEVEL 8 on A and LEVEL 7 on B, 16 ranks each. Use it if `cluster`
+  turns out slower: compare step rates in `run_L8/log.txt`.
 
 Jobs run in detached tmux sessions (`basilisk_L8`, `basilisk_L7`). Each h5 lands in
 `cfd_data/` on the Spark that ran the job.

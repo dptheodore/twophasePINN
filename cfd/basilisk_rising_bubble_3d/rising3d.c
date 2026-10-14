@@ -46,13 +46,25 @@ static const double SNAP_TIMES[] = {
 #define NSNAP (sizeof (SNAP_TIMES)/sizeof (SNAP_TIMES[0]))
 
 /* No-slip on the z walls (Basilisk: back = z min, front = z max). x and y are
-   made periodic in main(). */
+   made periodic in main(), unless WALLS is set: -DWALLS=1 puts no-slip walls on all six
+   faces, the setup of the 3D benchmark (Adelsberger et al. 2014), to validate the solver
+   against its published numbers. Training data uses the default (periodic) build. */
 u.n[front] = dirichlet(0);
 u.t[front] = dirichlet(0);
 u.r[front] = dirichlet(0);
 u.n[back]  = dirichlet(0);
 u.t[back]  = dirichlet(0);
 u.r[back]  = dirichlet(0);
+#if WALLS
+u.t[left]   = dirichlet(0);
+u.r[left]   = dirichlet(0);
+u.t[right]  = dirichlet(0);
+u.r[right]  = dirichlet(0);
+u.t[bottom] = dirichlet(0);
+u.r[bottom] = dirichlet(0);
+u.t[top]    = dirichlet(0);
+u.r[top]    = dirichlet(0);
+#endif
 
 int main (int argc, char * argv[])
 {
@@ -62,8 +74,10 @@ int main (int argc, char * argv[])
   dimensions (nx = 1, ny = 1, nz = 2);
   size (1.);
   origin (-0.5, -0.5, -1.);
+#if !WALLS
   periodic (right);
   periodic (top);
+#endif
 
   rho1 = 1000., mu1 = 10.;
   rho2 = 100.,  mu2 = 1.;
