@@ -4,12 +4,16 @@ import pandas as pd
 import h5py
 
 ''' 3D counterpart of generate_points.py, kept equivalent to it in every respect except
-the added dimension. It reads H5_PATH: either "rising_bubble_3d.h5" (written by
-revolve_2d_to_3d.py from the 2D "rising_bubble.h5": the 2D bubble revolved about its
-vertical axis into a sphere, levelset only) or "rising_bubble_3d_basilisk.h5" (a real 3D
+the added dimension. It reads H5_PATH: "rising_bubble_3d_basilisk_L8.h5" (a real 3D
 Basilisk simulation of the same case, cfd/basilisk_rising_bubble_3d, via basilisk_to_h5.py)
-and produces the same training-point dataframes as get_training_data, extended with a
-z coordinate and a w velocity.
+or "rising_bubble_3d.h5" (written by revolve_2d_to_3d.py from the 2D "rising_bubble.h5":
+the 2D bubble revolved about its vertical axis into a sphere, levelset only), and produces
+the same training-point dataframes as get_training_data, extended with a z coordinate and
+a w velocity.
+
+The Basilisk file stores 39 snapshots, each tagged in its "split" dataset: the 29
+TRAIN_TIMES and 10 held-out validation times (every 0.3 from 0.16). Training points come
+only from the "train" snapshots; get_validation_data_3d samples the "validation" ones.
 
 Axis convention (shared with revolve_2d_to_3d.py and lift_2d_initial_weights):
     2D x (horizontal)  -> 3D x and y   (the box is 1 x 1 x 2, bubble on the z axis)
@@ -25,7 +29,7 @@ like the 2D east/west faces:
     front/back (y)       pairing of u, v, w, p
 Space and time are nondimensionalised by L_ref = 0.25 (U_ref = 1), as in 2D. '''
 
-H5_PATH = "../cfd_data/rising_bubble_3d.h5"
+H5_PATH = "../cfd_data/rising_bubble_3d_basilisk_L8.h5"
 L_REF = 0.25
 # The 2D selection, indices [0, 15] + [30:100:5] + [100::5] + [1, 2] of the 0.02-spaced
 # snapshots, as times: 0, 0.02, 0.04, 0.3, then every 0.1 from 0.6 to 3.0.
@@ -279,12 +283,16 @@ def get_training_data_3d(NOP_A, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_wes
         times = np.array(data["time"])
 
         # TIME SNAPSHOT SELECTION (identical to 2D). Selected by time value, not position,
-        # so files holding only these snapshots (rising_bubble_3d_basilisk.h5: 29 training
-        # + 10 validation times) give the same set as the full 151-snapshot one. Read only
-        # the selected snapshots -- the full 3D levelset (~20 GB) does not need to be in memory.
-        indices = np.array([np.argmin(np.abs(times - t)) for t in TRAIN_TIMES])
+        # so files holding only these snapshots (the Basilisk file: 29 training + 10
+        # validation times) give the same set as the full 151-snapshot one. Only snapshots
+        # tagged "train" are candidates, so a validation snapshot can never be picked. Read
+        # only the selected snapshots -- the full 3D levelset does not need to be in memory.
+        candidates = np.arange(len(times))
+        if "split" in data:
+            candidates = candidates[np.array(data["split"]) == b"train"]
+        indices = candidates[[np.argmin(np.abs(times[candidates] - t)) for t in TRAIN_TIMES]]
         off = np.abs(times[indices] - TRAIN_TIMES)
-        assert off.max() < 0.005, f"no snapshot near t = {TRAIN_TIMES[off.argmax()]}"
+        assert off.max() < 0.005, f"no training snapshot near t = {TRAIN_TIMES[off.argmax()]}"
         times = times[indices]
         levelset = -np.array(data["levelset"][indices])
 
@@ -333,6 +341,42 @@ def get_training_data_3d(NOP_A, NOP_PDE, NOP_north, NOP_south, NOP_east, NOP_wes
     data_PDE = pd.DataFrame(data=np.vstack([data_PDE, np.hstack([data_nsew, np.zeros((len(data_nsew), 1))])]),
                             columns=["x_PDE", "y_PDE", "z_PDE", "t_PDE", "f_PDE"])
     return dict(A=data_A, PDE=data_PDE, N=data_N, EW=data_EW, FB=data_FB, NSEW=data_NSEW)
+
+
+def get_validation_data_3d(NOP, seed=4321):
+    ''' Samples the held-out "validation" snapshots of H5_PATH for comparison with the
+    network: per snapshot NOP[0] cells within 4 cells of the interface (|levelset| <= 4,
+    the band the domain sampling above leaves out) and NOP[1] cells anywhere. Returns a
+    dataframe with columns x, y, z, t, a, u, v, w, p, nondimensionalised like the training
+    points: x, y, z, t by L_ref (U_ref = 1, so velocities are unchanged), p by
+    rho_ref U_ref^2 = 1000 (the h5 gauge puts the top wall at p = 1000, i.e. the trainer's
+    p_N = 1), and a = 1 - volume_fraction (the h5 stores the LIQUID fraction; the network's
+    a is 1 in the bubble). Uses its own generator, so the global numpy stream -- and with
+    it the training points -- is the same with or without validation. '''
+
+    rng = np.random.default_rng(seed)
+    p_ref = 1000.0
+    rows = []
+    with h5py.File(H5_PATH, "r") as data:
+        assert "split" in data, f"{H5_PATH} has no train/validation split"
+        X, Y, Z = (np.array(data[k], dtype=float) for k in ("X", "Y", "Z"))
+        times = np.array(data["time"])
+        val = np.where(np.array(data["split"]) == b"validation")[0]
+        for i in val:
+            levelset = np.array(data["levelset"][i])
+            near = np.flatnonzero(np.abs(levelset) <= 4)
+            flat = np.concatenate([rng.choice(near, NOP[0], replace=False),
+                                   rng.choice(levelset.size, NOP[1], replace=False)])
+            iz, iy, ix = np.unravel_index(flat, levelset.shape)
+            fields = {k: np.array(data[name][i]).ravel()[flat]
+                      for k, name in (("a", "volume_fraction"), ("u", "velocityX"),
+                                      ("v", "velocityY"), ("w", "velocityZ"), ("p", "pressure"))}
+            rows.append(np.stack([X[ix] / L_REF, Y[iy] / L_REF, Z[iz] / L_REF,
+                                  np.full(len(flat), times[i] / L_REF),
+                                  1.0 - fields["a"], fields["u"], fields["v"], fields["w"],
+                                  fields["p"] / p_ref], axis=1))
+    print(f"Validation points: {sum(NOP)} per snapshot at t = {np.round(times[val], 2)}")
+    return pd.DataFrame(np.vstack(rows), columns=["x", "y", "z", "t", "a", "u", "v", "w", "p"])
 
 
 def lift_2d_initial_weights(path="initial_weights.h5"):

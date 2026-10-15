@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 LEVEL=${1:-8}
 NP=${2:-16}
 RUN=run_L${LEVEL}
-DST=../../cfd_data/rising_bubble_3d_basilisk_L${LEVEL}.h5
+DST=$(cd ../.. && pwd)/cfd_data/rising_bubble_3d_basilisk_L${LEVEL}.h5
 
 make rising3d_mpi
 mkdir -p "$RUN"

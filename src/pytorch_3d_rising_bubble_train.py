@@ -18,7 +18,8 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from generate_points_3d import get_training_data_3d, lift_2d_initial_weights
+import generate_points_3d
+from generate_points_3d import get_training_data_3d, get_validation_data_3d, lift_2d_initial_weights
 from pytorch_utilities import NNCreator, writeToJSONFile
 
 # Every rank seeds identically and so generates the SAME training points. The data is
@@ -237,6 +238,32 @@ def compute_loss(model, physics, data_A, data_PDE, data_N, data_EW, data_FB, dat
     return total_loss, loss_a_A, loss_BC, loss_PDE_m, loss_PDE_u, loss_PDE_v, loss_PDE_w, loss_PDE_a
 
 
+VALIDATION_COLUMNS = ["mse_a", "rel_l2_u", "rel_l2_v", "rel_l2_w", "rel_l2_p"]
+
+
+def evaluate_validation(net, val, chunk=20000):
+    """Compares the network with the CFD on the held-out validation snapshots: MSE of the
+    volume fraction (the quantity loss_a fits on the training snapshots) and relative L2
+    errors of u, v, w, p, which the training loss never sees as data."""
+    preds = []
+    with torch.no_grad():
+        for s in range(0, len(val["xyzt"]), chunk):
+            preds.append(torch.cat(net(val["xyzt"][s:s + chunk]), dim=1))
+    u, v, w, p, a = torch.cat(preds).T
+    ref = val["uvwpa"]
+
+    def rel_l2(pred, true):
+        return (torch.linalg.norm(pred - true) / torch.linalg.norm(true)).item()
+
+    return dict(mse_a=torch.mean((a - ref[:, 4]) ** 2).item(),
+                rel_l2_u=rel_l2(u, ref[:, 0]), rel_l2_v=rel_l2(v, ref[:, 1]),
+                rel_l2_w=rel_l2(w, ref[:, 2]), rel_l2_p=rel_l2(p, ref[:, 3]))
+
+
+def format_validation(metrics):
+    return ", ".join(f"{k}: {metrics[k]:.4e}" for k in VALIDATION_COLUMNS)
+
+
 def train_step(model, optimizer, physics, batch):
     optimizer.zero_grad()
     losses = compute_loss(model, physics, *batch)
@@ -362,6 +389,18 @@ def main():
     with contextlib.redirect_stdout(sys.stdout if is_main else open(os.devnull, "w")):
         training_data = get_training_data_3d(NOP_a, NOP_PDE, NOP_north, NOP_south, NOP_east,
                                              NOP_west, NOP_front_back)
+    logger.info(f"Training data: {os.path.abspath(generate_points_3d.H5_PATH)}")
+
+    # The 10 held-out snapshots, never used for training. Only rank 0 reports, so only it
+    # loads them: (near-interface, anywhere) points per snapshot.
+    NOP_validation = (2000, 8000)
+    val = None
+    if is_main:
+        val_df = get_validation_data_3d(NOP_validation)
+        val = dict(xyzt=torch.tensor(val_df[["x", "y", "z", "t"]].to_numpy(), dtype=torch.float32, device=device),
+                   uvwpa=torch.tensor(val_df[["u", "v", "w", "p", "a"]].to_numpy(), dtype=torch.float32, device=device))
+        logger.info(f"Validation: {len(val_df)} points on the held-out snapshots "
+                    f"t = {np.unique(np.round(val_df['t'].to_numpy() * generate_points_3d.L_REF, 2))}")
 
     # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
@@ -391,7 +430,8 @@ def main():
     else:
         model = net
 
-    # Physical parameters of the 2D Hysing benchmark, as in rising_bubble_train.py
+    # Physical parameters of the 2D Hysing benchmark, as in rising_bubble_train.py, and of
+    # the Basilisk run (index 0 = bubble, where a = 1; index 1 = liquid)
     mu = [1.0, 10.0]
     sigma = 24.5
     g = -0.98
@@ -422,6 +462,11 @@ def main():
     start_total = time.time()
     history_loss_a, history_loss_f_uvw, history_loss_f_ma = [], [], []
     current_best_total_loss = float('inf')
+    # Written as training goes, so a stopped run keeps its validation history.
+    validation_path = os.path.join(dirname, "validation_history.csv") if is_main else None
+    if is_main:
+        with open(validation_path, "w") as fh:
+            fh.write(",".join(["epoch"] + VALIDATION_COLUMNS) + "\n")
 
     num_batches, prop_batch_sizes = None, None
 
@@ -474,6 +519,12 @@ def main():
                 log_msg += f" | a: {loss_a:.4e}, BC: {loss_bc:.4e}, m: {loss_m:.4e}"
                 log_msg += f", u: {loss_u:.4e}, v: {loss_v:.4e}, w: {loss_w:.4e}, pde_a: {loss_pde_a:.4e}"
                 logger.info(log_msg)
+                if is_main:
+                    metrics = evaluate_validation(model.module if is_distributed else model, val)
+                    logger.info(f"    validation | {format_validation(metrics)}")
+                    with open(validation_path, "a") as fh:
+                        fh.write(",".join([str(len(history_loss_a))] +
+                                          [f"{metrics[k]:.6e}" for k in VALIDATION_COLUMNS]) + "\n")
 
             if is_main and epoch % checkpoint_interval == 0 and total_loss < current_best_total_loss:
                 logger.info(f"Saving checkpoint at epoch {epoch} with loss {total_loss:.4e}")
@@ -533,6 +584,12 @@ def main():
         logger.info(f"MSE_f,v                    : {loss_v:.4e}")
         logger.info(f"MSE_f,w                    : {loss_w:.4e}")
         logger.info(f"MSE_f,a                    : {loss_pde_a:.4e}")
+        logger.info("----------------------------")
+        metrics = evaluate_validation(underlying_net, val)
+        logger.info("--- Held-out validation snapshots (vs CFD) ---")
+        logger.info(f"MSE_alpha                  : {metrics['mse_a']:.4e}")
+        for k in "uvwp":
+            logger.info(f"rel. L2 error {k}            : {metrics['rel_l2_' + k]:.4e}")
         logger.info("----------------------------\n")
 
         logger.info("Generating and saving loss history plots...")
