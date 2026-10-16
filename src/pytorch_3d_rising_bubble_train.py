@@ -19,7 +19,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import generate_points_3d
-from generate_points_3d import get_training_data_3d, get_validation_data_3d, lift_2d_initial_weights
+from generate_points_3d import get_training_data_3d, get_validation_data_3d
 from pytorch_utilities import NNCreator, writeToJSONFile
 
 # Every rank seeds identically and so generates the SAME training points. The data is
@@ -46,23 +46,6 @@ def build_activation_dict(hidden_layers, activation_functions, adaptive_activati
                 func_name = name
         activation_dict[layer_no] = [func_name, None, adaptive_activation_n[layer_no - 1]]
     return activation_dict
-
-
-def load_lifted_2d_weights(net, path):
-    """Loads the 2D Keras starting weights, lifted to 3D by
-    generate_points_3d.lift_2d_initial_weights, into an NNCreator network. Keras kernels
-    are (in, out) and torch Linear weights (out, in), hence the transposes."""
-    weights = lift_2d_initial_weights(path)
-    state = {}
-    for i in range(len(net.hidden_layers)):
-        kernel, bias = weights["dense" if i == 0 else f"dense_{i}"]
-        state[f"hidden_layers.{i}.linear.weight"] = torch.tensor(kernel.T)
-        state[f"hidden_layers.{i}.linear.bias"] = torch.tensor(bias)
-    for name in net.output_layers:
-        kernel, bias = weights[name]
-        state[f"output_layers.{name}.weight"] = torch.tensor(kernel.T)
-        state[f"output_layers.{name}.bias"] = torch.tensor(bias)
-    net.load_state_dict(state)
 
 
 def compute_gradients(model, x, y, z, t):
@@ -404,11 +387,11 @@ def main():
     ]
 
     nn_creator = NNCreator(torch.float32)
+    # Fresh Xavier init, no 2D starting weights: the lifted 2D network had a zero y row in
+    # its first layer, and on the y-symmetric 3D bubble the gradient on that row cancels,
+    # so it could not leave the y-independent (cylinder) solution.
     net = nn_creator.get_model_dnn(4, hidden_layers, output_layer, activation_functions_dict, False)
-    load_lifted_2d_weights(net, 'initial_weights.h5')
     net.to(device)
-    logger.info("Loaded initial_weights.h5 (the 2D starting point) lifted to 3D: "
-                "u3(x,y,z,t) = u2(x,z,t), w3 = v2, p3 = p2, a3 = a2, v3 = 0")
 
     if is_distributed:
         model = DDP(net, device_ids=[local_rank] if torch.cuda.is_available() else None)
@@ -435,9 +418,11 @@ def main():
     checkpoint_interval = 10
     # Batches per epoch across ALL ranks, rounded up to a multiple of world_size so every
     # rank takes the same number of steps (unequal counts deadlock DDP's all-reduce). The
-    # per-GPU batch therefore stays ~1/50 of the data; the effective batch per optimizer
-    # step is world_size times that.
-    num_of_batches = math.ceil(50 / world_size) * world_size
+    # per-GPU batch therefore stays ~1/batches_per_epoch of the data; the effective batch
+    # per optimizer step is world_size times that. Peak memory is ~1.35 GiB per 1000 points
+    # per GPU (measured), so 16 gives ~11.6k points / ~16 GiB per 24 GB 4090.
+    batches_per_epoch = 16
+    num_of_batches = math.ceil(batches_per_epoch / world_size) * world_size
 
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches)
