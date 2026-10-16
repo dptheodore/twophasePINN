@@ -15,7 +15,7 @@ The Basilisk file stores 39 snapshots, each tagged in its "split" dataset: the 2
 TRAIN_TIMES and 10 held-out validation times (every 0.3 from 0.16). Training points come
 only from the "train" snapshots; get_validation_data_3d samples the "validation" ones.
 
-Axis convention (shared with revolve_2d_to_3d.py and lift_2d_initial_weights):
+Axis convention (shared with revolve_2d_to_3d.py):
     2D x (horizontal)  -> 3D x and y   (the box is 1 x 1 x 2, bubble on the z axis)
     2D y (vertical)    -> 3D z         gravity acts along z, so it sits in the w equation
 Fields are stored as (time, Z, Y, X) on the 2D grid spacing, so the cell-unit levelset
@@ -377,29 +377,3 @@ def get_validation_data_3d(NOP, seed=4321):
                                   fields["p"] / p_ref], axis=1))
     print(f"Validation points: {sum(NOP)} per snapshot at t = {np.round(times[val], 2)}")
     return pd.DataFrame(np.vstack(rows), columns=["x", "y", "z", "t", "a", "u", "v", "w", "p"])
-
-
-def lift_2d_initial_weights(path="initial_weights.h5"):
-    ''' Lifts the 2D starting weights (the Keras checkpoint every 2D run loads) to the 3D
-    network, so the 3D run starts from the same function the 2D run does:
-        u3(x, y, z, t) = u2(x, z, t),   w3 = v2,   p3 = p2,   a3 = a2,   v3 = 0.
-    The first-layer kernel gets a zero row for the new y input and the 2D y row moves to
-    z; the new v output starts at zero. Returns Keras-convention arrays -- kernels are
-    (in, out) -- as {layer_name: (kernel, bias)}, with hidden layers named "dense",
-    "dense_1", ... and outputs "output_u", "output_v", "output_w", "output_p", "output_a". '''
-
-    weights = {}
-    with h5py.File(path, "r") as f:
-        for name in f:
-            if name.startswith("dense") or name.startswith("output_"):
-                group = f[name][name]
-                kernel = next(np.array(group[k]) for k in group if k.startswith("kernel"))
-                bias = next(np.array(group[k]) for k in group if k.startswith("bias"))
-                weights[name] = (kernel, bias)
-
-    k2, b2 = weights["dense"]
-    assert k2.shape[0] == 3, "expected a 2D (x, y, t) input layer, got %s" % (k2.shape,)
-    weights["dense"] = (np.stack([k2[0], np.zeros_like(k2[0]), k2[1], k2[2]]), b2)
-    weights["output_w"] = weights["output_v"]
-    weights["output_v"] = (np.zeros_like(weights["output_w"][0]), np.zeros_like(weights["output_w"][1]))
-    return weights

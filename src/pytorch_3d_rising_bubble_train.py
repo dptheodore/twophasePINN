@@ -416,13 +416,13 @@ def main():
     epochs_list = [5000] * 5
     learning_rates = [1e-4, 5e-5, 1e-5, 5e-6, 1e-6]
     checkpoint_interval = 10
-    # Batches per epoch across ALL ranks, rounded up to a multiple of world_size so every
-    # rank takes the same number of steps (unequal counts deadlock DDP's all-reduce). The
-    # per-GPU batch therefore stays ~1/batches_per_epoch of the data; the effective batch
-    # per optimizer step is world_size times that. Peak memory is ~1.35 GiB per 1000 points
-    # per GPU (measured), so 16 gives ~11.6k points / ~16 GiB per 24 GB 4090.
-    batches_per_epoch = 16
-    num_of_batches = math.ceil(batches_per_epoch / world_size) * world_size
+    # Optimizer steps per epoch, as in rising_bubble_train.py (num_of_batches = 20 on one
+    # process). Each DDP step consumes one batch per rank, so the data is split into
+    # steps_per_epoch * world_size batches; every rank takes the same number of steps
+    # (unequal counts deadlock DDP's all-reduce). Peak memory is ~1.35 GiB per 1000 points
+    # per GPU (measured).
+    steps_per_epoch = 20
+    num_of_batches = steps_per_epoch * world_size
 
     num_samples_total = sum(len(df) for df in training_data.values())
     total_batch_size = math.ceil(num_samples_total / num_of_batches)
@@ -464,13 +464,14 @@ def main():
                 losses = train_step(model, optimizer, physics, batch)
                 epoch_losses.append([l.item() for l in losses])
 
-            # Summed over batches (not averaged) to match rising_bubble_train.py. Each rank
-            # runs num_batches // world_size of the batches, so summing across ranks gives
-            # the same epoch total a single-process run would print.
+            # Reported exactly as rising_bubble_train.py does: the SUM of the per-batch losses
+            # over its 20 batches. Here that is the mean over every batch of the epoch on all
+            # ranks times steps_per_epoch (= 20), so it does not depend on the GPU count.
             sum_losses = torch.tensor(np.sum(epoch_losses, axis=0), dtype=torch.float64, device=device)
             if is_distributed:
                 dist.all_reduce(sum_losses, op=dist.ReduceOp.SUM)
-            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_losses.tolist()
+            epoch_losses_2d = sum_losses / (num_local_batches * world_size) * steps_per_epoch
+            total_loss, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = epoch_losses_2d.tolist()
 
             history_loss_a.append(loss_a)
             history_loss_f_uvw.append(loss_u + loss_v + loss_w)
@@ -531,9 +532,9 @@ def main():
             batch_losses = compute_loss(underlying_net, physics, *batch)
             final_evaluation_losses.append([l.item() for l in batch_losses])
 
-        # Summed over batches to match rising_bubble_train.py.
-        sum_final_losses = np.sum(final_evaluation_losses, axis=0)
-        _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = sum_final_losses
+        # Same convention as the per-epoch log: 2D's sum over 20 batches.
+        final_losses_2d = np.mean(final_evaluation_losses, axis=0) * steps_per_epoch
+        _, loss_a, loss_bc, loss_m, loss_u, loss_v, loss_w, loss_pde_a = final_losses_2d
 
         logger.info("--- Final Loss Breakdown ---")
         logger.info(f"MSE_alpha (volume fraction): {loss_a:.4e}")
