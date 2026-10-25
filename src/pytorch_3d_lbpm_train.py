@@ -426,7 +426,7 @@ def main():
     # steps_per_epoch * world_size batches; every rank takes the same number of steps
     # (unequal counts deadlock DDP's all-reduce). Peak memory is ~1.35 GiB per 1000 points
     # per GPU (measured).
-    steps_per_epoch = 50
+    steps_per_epoch = 20
     num_of_batches = steps_per_epoch * world_size
 
     num_samples_total = sum(len(df) for df in training_data.values())
