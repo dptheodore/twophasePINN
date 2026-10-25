@@ -22,38 +22,21 @@ import generate_points_3d_pr as pr
 from generate_points_3d_pr import get_training_data_3d_pr
 from pytorch_utilities import NNCreator
 
-''' Peng-Robinson counterpart of pytorch_3d_rising_bubble_train.py.
+''' Density-free variant of the Peng-Robinson trainer on the LBPM h5.
 
-Inputs (x, y, z, t); outputs (u, v, w, rho, a). Density is now a network output
-supervised directly from the h5, instead of being reconstructed from a volume fraction
-as rho2 + (rho1 - rho2) * a. That matters for a single-component Peng-Robinson fluid: rho
-is THE state variable, the interface is a smooth density profile set by kappa, and the
-bulk densities are not pinned at the .db's rhoA/rhoB (the data runs 0.45 .. 5.95).
+Inputs (x, y, z, t); outputs (u, v, w, p, a). Nothing about density or the Peng-Robinson
+EOS enters the network or the losses: no rho output, no rho supervision, no P_PR(rho).
+The residuals are the constant-density incompressible equations, nondimensional:
 
-Residuals, all nondimensional (see generate_points_3d_pr for the derivation from LBPM):
+  continuity  div(u) = 0
+  momentum    Du/Dt = -grad(p) + (1/Re) lap(u) + g(t)/Fr
 
-  continuity  rho_t + u . grad(rho) + rho div(u) = 0
-  momentum    rho Du/Dt = -Eu grad(p) + (Ko rho + Kb) grad(lap(rho)) + div(tau) + rho g(t)/Fr
-
-with p = P_PR(rho) / p_scale substituted exactly, not learned.
-
-Eu = k^2 p_scale / (rho_ref U_ref^2) carries LBPM's k-transformation factor. Kb =
-LATTICE_BETA / (L_ref U_ref)^2 is the rho-independent Korteweg-like term the CFD obeys on
-top of kappa (see generate_points_3d_pr); without it the CFD's own rho profile is not a
-solution and the network trades rho accuracy for momentum loss. a takes no part in the
+p is a learned kinematic pressure (p / (rho U_ref^2)); it is not supervised, since the
+h5 pressure is P_PR(density), an EOS pressure rather than this one. a takes no part in the
 physics: it is a supervised phase indicator kept for interface tracking and post-processing.
 
-Why p is not a network output (it was until 2026-10-14, held to P_PR(rho) by a soft EOS
-residual): at the interface Eu grad(p) and the Korteweg term are each ~33 and cancel to ~1%
-on the CFD. With p free the network kept p nearly flat, paid ~0.02 of EOS loss, and smoothed
-rho to half the drop density so the Korteweg term had nothing to balance (run
-pr_Oct-13-2026_21-24-25: momentum ~4e-6 with its own p, ~13 in the band with
-p = P_PR(rho_net), against ~0.16 for the CFD truth). The h5 pressure is P_PR(density) to
-2e-8, so the identity is imposed exactly and the decoupled escape no longer exists.
-
-Viscous stress tau = mu (grad u + grad u^T) + BULK_LAMBDA mu div(u) I with mu = rho nu.
-BULK_LAMBDA = 0 is the lattice-Boltzmann stress (bulk viscosity 2 mu / 3); -2/3 would be
-Stokes' hypothesis, which the earlier 3D script used. '''
+The h5 velocities are still half-force corrected (u_h5 + F / (2 rho)) by the generator,
+which needs the h5 density for that; that is data preparation, not training. '''
 
 # Every rank seeds identically and so generates the SAME training points. The data is
 # then partitioned at batch level (rank r trains batches r, r + N, r + 2N, ... of a
@@ -61,8 +44,6 @@ Stokes' hypothesis, which the earlier 3D script used. '''
 # number of GPUs.
 np.random.seed(1234)
 torch.manual_seed(1234)
-
-BULK_LAMBDA = 0.0
 
 # Body force along z.
 #   "ramp":    LBPM's nominal g(t) = 2e-6 * floor(t / 20000), imposed.
@@ -73,23 +54,17 @@ BULK_LAMBDA = 0.0
 #              the domain momentum budget logged alongside it.
 GRAVITY_MODE = "learned"
 
-# Which fields besides a are supervised from the h5. ("rho",) infers u, v, w and p from
-# the physics alone; add "u", "v", "w" (and/or "p") for a data-assisted run. A learned
-# g(t) needs the velocities: with density alone the network can invent velocities to suit
-# whatever g it lands on, and g is barely identifiable.
-SUPERVISED = ("rho", "u", "v", "w") if GRAVITY_MODE == "learned" else ("rho",)
+# Fields supervised from the h5 besides a. With density gone the velocities are the only
+# data that couple to the physics (a does not), so they are always supervised.
+SUPERVISED = ("u", "v", "w")
 
-Physics = namedtuple(
-    "Physics",
-    ["one_Re", "Eu", "Ko", "Kb", "U_ref", "L_ref", "rho_ref", "p_scale",
-     "drho_star", "loss_weights_PDE", "loss_weights_DATA"],
-)
+Physics = namedtuple("Physics", ["one_Re", "loss_weights_PDE", "loss_weights_DATA"])
 
 
 class PINN(torch.nn.Module):
     """The field network plus the body force g(t), so that DDP sees (and syncs) the
     learned force's parameters like any other weight. forward() returns
-    (u, v, w, rho, a, g_star), g_star = g(t) L_ref / U_ref^2."""
+    (u, v, w, p, a, g_star), g_star = g(t) L_ref / U_ref^2."""
 
     def __init__(self, net, mode, t_knots, T_ref, t_origin, L_ref, U_ref):
         super().__init__()
@@ -138,11 +113,6 @@ def grad(f, x):
     return torch.autograd.grad(f, x, torch.ones_like(f), create_graph=True)[0]
 
 
-def pressure_star(rho, physics):
-    """p* = P_PR(rho) / p_scale, rho nondimensional."""
-    return pr.pressure_pr(rho * physics.rho_ref) / physics.p_scale
-
-
 def PDE_caller(model, physics, x, y, z, t):
     """Residuals of continuity and the three momentum components.
 
@@ -155,40 +125,23 @@ def PDE_caller(model, physics, x, y, z, t):
     t = t.requires_grad_(True)
     X = (x, y, z)
 
-    u, v, w, rho, _, gz = model(torch.cat([x, y, z, t], dim=1))
-    p = pressure_star(rho, physics)
+    u, v, w, p, _, gz = model(torch.cat([x, y, z, t], dim=1))
     vel = (u, v, w)
 
     # First derivatives: dvel[i][j] = d vel_i / d x_j.
     dvel = [[grad(c, xj) for xj in X] for c in vel]
     vel_t = [grad(c, t) for c in vel]
-    drho = [grad(rho, xj) for xj in X]
-    rho_t = grad(rho, t)
     dp = [grad(p, xj) for xj in X]
-
-    div_u = dvel[0][0] + dvel[1][1] + dvel[2][2]
-    ddiv = [grad(div_u, xj) for xj in X]
     lap_vel = [sum(grad(dvel[i][j], X[j]) for j in range(3)) for i in range(3)]
 
-    # Korteweg force needs THIRD derivatives of rho: grad(lap(rho)).
-    lap_rho = sum(grad(drho[j], X[j]) for j in range(3))
-    dlap_rho = [grad(lap_rho, xj) for xj in X]
+    PDE_m = dvel[0][0] + dvel[1][1] + dvel[2][2]
 
-    PDE_m = rho_t + u * drho[0] + v * drho[1] + w * drho[2] + rho * div_u
-
-    lam = BULK_LAMBDA
     PDE_mom = []
     for i in range(3):
         accel = vel_t[i] + u * dvel[i][0] + v * dvel[i][1] + w * dvel[i][2]
-        # div(tau)_i / (rho_ref U^2 / L) with mu* = rho* nu:
-        # rho (lap u_i + (1 + lam) d_i div) + d_j rho (d_j u_i + d_i u_j) + lam d_i rho div
-        visc = rho * (lap_vel[i] + (1.0 + lam) * ddiv[i]) + \
-            sum(drho[j] * (dvel[i][j] + dvel[j][i]) for j in range(3)) + \
-            lam * drho[i] * div_u
-        res = rho * accel + physics.Eu * dp[i] - (physics.Ko * rho + physics.Kb) * dlap_rho[i] - \
-            physics.one_Re * visc
+        res = accel + dp[i] - physics.one_Re * lap_vel[i]
         if i == 2:
-            res = res - rho * gz
+            res = res - gz
         PDE_mom.append(res)
 
     return PDE_m, PDE_mom[0], PDE_mom[1], PDE_mom[2]
@@ -199,17 +152,11 @@ def compute_loss(model, physics, data_DATA, data_PDE):
     targets = data_DATA[4:-1]
     a_D = data_DATA[-1]
 
-    # DATA LOSSES. rho is compared in units of the liquid-gas density jump so its loss is
-    # on the same O(1) footing as a's; velocities and p are already O(1) in u*, p*.
-    u, v, w, rho, a, _ = model(torch.cat([x_D, y_D, z_D, t_D], dim=1))
-    pred = dict(rho=rho, u=u, v=v, w=w, p=pressure_star(rho, physics))
+    # DATA LOSSES. Velocities are already O(1) in u*.
+    u, v, w, _, a, _ = model(torch.cat([x_D, y_D, z_D, t_D], dim=1))
+    pred = dict(u=u, v=v, w=w)
     loss_a = torch.mean((a_D - a) ** 2)
-    loss_fields = []
-    for name, target in zip(SUPERVISED, targets):
-        err = pred[name] - target
-        if name == "rho":
-            err = err / physics.drho_star
-        loss_fields.append(torch.mean(err ** 2))
+    loss_fields = [torch.mean((pred[name] - target) ** 2) for name, target in zip(SUPERVISED, targets)]
     loss_data = loss_a + torch.dot(torch.stack(loss_fields), physics.loss_weights_DATA)
 
     x_P, y_P, z_P, t_P = data_PDE
@@ -240,7 +187,7 @@ def train_step(model, optimizer, physics, data_DATA, data_PDE):
 def setup_output_directory():
     if not os.path.exists("checkpoints"):
         os.mkdir("checkpoints")
-    dirname = os.path.abspath(os.path.join("checkpoints", "pr_" + datetime.now().strftime("%b-%d-%Y_%H-%M-%S")))
+    dirname = os.path.abspath(os.path.join("checkpoints", "pr_uvwp_" + datetime.now().strftime("%b-%d-%Y_%H-%M-%S")))
     os.mkdir(dirname)
 
     shutil.copyfile(__file__, os.path.join(dirname, os.path.basename(__file__)))
@@ -374,11 +321,9 @@ def main():
     activation_functions = {activation_choice: range(1, no_layers + 1)}
     activation_functions_dict = build_activation_dict(hidden_layers, activation_functions, adaptive_activation_n)
 
-    # rho* = exp(.) keeps density positive, so P_PR stays on its physical branch. No p
-    # output: p* = P_PR(rho) / p_scale (see the module docstring).
     output_layer = [
         ("output_u", None), ("output_v", None), ("output_w", None),
-        ("output_rho", "exponential"), ("output_a", "sigmoid"),
+        ("output_p", None), ("output_a", "sigmoid"),
     ]
 
     nn_creator = NNCreator(torch.float32)
@@ -387,29 +332,21 @@ def main():
     pinn = PINN(net, GRAVITY_MODE, scales["t_knots"], scales["T_ref"], scales["t_origin"],
                 scales["L_ref"], scales["U_ref"]).to(device)
     logger.info(f"Periodic lengths (nondimensional): {scales['period']}")
-    logger.info(f"Supervised fields: a + {SUPERVISED}, BULK_LAMBDA = {BULK_LAMBDA}, "
-                f"GRAVITY_MODE = {GRAVITY_MODE}")
+    logger.info(f"Supervised fields: a + {SUPERVISED}, GRAVITY_MODE = {GRAVITY_MODE}")
 
     model = DDP(pinn, device_ids=[local_rank] if torch.cuda.is_available() else None) \
         if is_distributed else pinn
 
-    L_ref, U_ref, rho_ref, p_scale = scales["L_ref"], scales["U_ref"], scales["rho_ref"], scales["p_scale"]
+    L_ref, U_ref = scales["L_ref"], scales["U_ref"]
     one_Re = pr.NU / (U_ref * L_ref)
-    Eu = pr.K_FACTOR ** 2 * p_scale / (rho_ref * U_ref ** 2)
-    Ko = pr.PR_KAPPA * rho_ref / (L_ref ** 2 * U_ref ** 2)
-    Kb = pr.LATTICE_BETA / (L_ref ** 2 * U_ref ** 2)
     logger.info(f"L_ref={L_ref:.4f} cells, U_ref={U_ref:.6g} cells/step, T_ref={scales['T_ref']:.1f} steps")
-    logger.info(f"1/Re={one_Re:.4f}, Eu={Eu:.4f}, Ko={Ko:.4f}, Kb={Kb:.4f}, "
-                f"1/Fr(g=2e-6)={pr.FORCE_INCREMENT * L_ref / U_ref ** 2:.4f}")
+    logger.info(f"1/Re={one_Re:.4f}, 1/Fr(g=2e-6)={pr.FORCE_INCREMENT * L_ref / U_ref ** 2:.4f}")
 
-    # [continuity, u, v, w] -- same weighting as the 3D script. Interface residuals are
-    # dominated by the Eu grad(p) / Ko grad(lap(rho)) balance, so if the momentum losses
-    # swamp everything else, these are the first knobs to turn.
+    # [continuity, u, v, w] -- same weighting as the 3D script.
     loss_weights_PDE = [1.0, 10.0, 10.0, 10.0]
     loss_weights_DATA = [1.0] * len(SUPERVISED)
     physics = Physics(
-        one_Re=one_Re, Eu=Eu, Ko=Ko, Kb=Kb, U_ref=U_ref, L_ref=L_ref, rho_ref=rho_ref, p_scale=p_scale,
-        drho_star=(pr.RHO_LIQ - pr.RHO_GAS) / rho_ref,
+        one_Re=one_Re,
         loss_weights_PDE=torch.tensor(loss_weights_PDE, dtype=torch.float32, device=device),
         loss_weights_DATA=torch.tensor(loss_weights_DATA, dtype=torch.float32, device=device),
     )
