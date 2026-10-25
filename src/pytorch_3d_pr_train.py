@@ -153,11 +153,14 @@ def compute_loss(model, physics, data_DATA, data_PDE):
     a_D = data_DATA[-1]
 
     # DATA LOSSES. Velocities are already O(1) in u*.
-    u, v, w, _, a, _ = model(torch.cat([x_D, y_D, z_D, t_D], dim=1))
+    u, v, w, p, a, _ = model(torch.cat([x_D, y_D, z_D, t_D], dim=1))
     pred = dict(u=u, v=v, w=w)
     loss_a = torch.mean((a_D - a) ** 2)
     loss_fields = [torch.mean((pred[name] - target) ** 2) for name, target in zip(SUPERVISED, targets)]
-    loss_data = loss_a + torch.dot(torch.stack(loss_fields), physics.loss_weights_DATA)
+    # Pressure gauge, mean(p) = 0. The PDEs see only grad(p), so without this p's constant
+    # is free and output_p's bias gets no gradient, which DDP rejects as an unused parameter.
+    loss_gauge = torch.mean(p) ** 2
+    loss_data = loss_a + torch.dot(torch.stack(loss_fields), physics.loss_weights_DATA) + loss_gauge
 
     x_P, y_P, z_P, t_P = data_PDE
     PDE_m, PDE_u, PDE_v, PDE_w = PDE_caller(model, physics, x_P, y_P, z_P, t_P)
@@ -169,11 +172,11 @@ def compute_loss(model, physics, data_DATA, data_PDE):
     loss_PDE = torch.dot(torch.stack([loss_m, loss_u, loss_v, loss_w]), physics.loss_weights_PDE)
 
     total_loss = loss_data + loss_PDE
-    return (total_loss, loss_a, *loss_fields, loss_m, loss_u, loss_v, loss_w)
+    return (total_loss, loss_a, *loss_fields, loss_gauge, loss_m, loss_u, loss_v, loss_w)
 
 
 def loss_names():
-    return ["total", "a"] + list(SUPERVISED) + ["m", "u_mom", "v_mom", "w_mom"]
+    return ["total", "a"] + list(SUPERVISED) + ["p_gauge", "m", "u_mom", "v_mom", "w_mom"]
 
 
 def train_step(model, optimizer, physics, data_DATA, data_PDE):
