@@ -28,7 +28,9 @@ Coordinates as generate_points_3d_lbpm: cells centred on the box, / L_ref; t is
 Frames returned by get_training_data_3d:
     DATA   x, y, z, t, rho_hat, phi_hat, p_hat   NOP[0] points 0-8 cells off the a = 0.5
                                                  surface (the whole levelset band), NOP[1]
-                                                 cells 4+ cells off it, per snapshot
+                                                 cells 4+ cells off it, per snapshot. The
+                                                 trainer passes NOP[1] = 0 and draws those
+                                                 every epoch from BulkSampler instead
     EW, FB, NS                                   periodic face pairs, as the LBPM trainer
     GEOM   x_geom, y_geom, z_geom, t_geom,       region centres, nondimensional;
            grad_x, grad_y, grad_z                grad_vec / h^2 = face-MEAN differences
@@ -62,6 +64,68 @@ def geom_half_size():
     ''' Half the region side, nondimensional (x / L_ref). '''
     with h5py.File(H5_PATH, "r") as data:
         return float(data["computation_regions"].attrs["region_half_size"]) / get_scales()["L_ref"]
+
+
+def periodic_lengths():
+    ''' Box size per axis, nondimensional: the periods of the network's sin/cos embedding. '''
+    with h5py.File(H5_PATH, "r") as data:
+        _, sizes = _cell_axes(data)
+    return [n / get_scales()["L_ref"] for n in sizes]
+
+
+class BulkSampler:
+    ''' Bulk DATA points drawn afresh on every call: NOP per training snapshot, uniform in
+    the box (not only at cell centres) and at least max_levelset cells off the a = 0.5
+    surface, with the CFD fields interpolated periodically as targets. Replaces a fixed
+    get_points_for_domain_3d set, between whose points the network grew a sub-cell plane
+    with rho < 0 that no training point ever saw (runs Oct-26-2026_02-00-01, 06-37-38).
+    sample() draws everything from the rng it is given, so ranks seeded alike agree. '''
+
+    def __init__(self, NOP, max_levelset=4.0):
+        scales, data_scales = get_scales(), get_data_scales()
+        with h5py.File(H5_PATH, "r") as data:
+            (self.X, self.Y, self.Z), sizes = _cell_axes(data)
+            times = np.array(data["time"], dtype=float)
+            indices = np.setdiff1d(np.arange(len(times)), VAL_INDICES)
+            # (snapshot, field, Z, Y, X), fields rho_hat, phi_hat, p_hat
+            self.fields = np.stack([np.stack(normalised_fields(data, i, scales, data_scales)).astype(np.float32)
+                                    for i in indices])
+        self.t = (times[indices] - scales["t_origin"]) / scales["T_ref"]
+        self.size = np.array(sizes, dtype=float)
+        self.lo = -self.size / 2
+        self.NOP, self.L_ref = NOP, scales["L_ref"]
+        self.phi_cut = max_levelset / PHI_SCALE
+
+    def _interpolate(self, k, pts):
+        """(n, 3) rho_hat, phi_hat, p_hat of snapshot k at pts: interpolate_periodic with the
+        trilinear weights shared by the three fields."""
+        s = (pts - np.array([self.X[0], self.Y[0], self.Z[0]])).T
+        base = np.floor(s).astype(int)
+        frac = (s - base).astype(np.float32)
+        nz, ny, nx = self.fields.shape[2:]
+        out = 0.0
+        for dz in (0, 1):
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    w = ((frac[0] if dx else 1 - frac[0]) * (frac[1] if dy else 1 - frac[1]) *
+                         (frac[2] if dz else 1 - frac[2]))
+                    # the slice between the index arrays puts the points first: (n, 3)
+                    out = out + w[:, None] * self.fields[k, :, (base[2] + dz) % nz, (base[1] + dy) % ny, (base[0] + dx) % nx]
+        return out
+
+    def sample(self, rng):
+        blocks = []
+        for k, t in enumerate(self.t):
+            kept, n = [], 0
+            while n < self.NOP:
+                pts = self.lo + rng.random((int(1.1 * (self.NOP - n)) + 64, 3)) * self.size
+                vals = self._interpolate(k, pts)
+                far = np.abs(vals[:, 1]) >= self.phi_cut
+                kept.append(np.column_stack([pts[far], vals[far]]))
+                n += far.sum()
+            rows = np.vstack(kept)[:self.NOP]
+            blocks.append(np.column_stack([rows[:, :3] / self.L_ref, np.full(self.NOP, t), rows[:, 3:]]))
+        return pd.DataFrame(np.vstack(blocks), columns=["x", "y", "z", "t", "rho_hat", "phi_hat", "p_hat"])
 
 
 def get_geom_data_3d():
@@ -106,8 +170,9 @@ def get_training_data_3d(NOP_data, NOP_NS, NOP_east, NOP_west, NOP_front_back):
     for k, t_value in enumerate(times):
         near = get_points_for_interface_3d(NOP_data[0], t_value, interface[k], normal[k],
                                            tangent1[k], tangent2[k], 1.0, 0.0, BULK_LEVELSET)
-        far = get_points_for_domain_3d(NOP_data[1], t_value, X, Y, Z, levelset[k], 4)
-        pts = np.vstack([near, far])[:, :4]
+        if NOP_data[1]:
+            near = np.vstack([near, get_points_for_domain_3d(NOP_data[1], t_value, X, Y, Z, levelset[k], 4)])
+        pts = near[:, :4]
         pts[:, :3] = np.mod(pts[:, :3] - lo_box, size) + lo_box
         targets = [interpolate_periodic(f, X, Y, Z, pts[:, :3]) for f in fields[k]]
         blocks.append(np.column_stack([pts, *targets]))

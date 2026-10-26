@@ -19,7 +19,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import generate_points_3d_lbpm_data
 from generate_points_3d_lbpm_data import (get_training_data_3d, get_validation_data_3d,
-                                          get_scales, get_data_scales, geom_half_size, PHI_SCALE)
+                                          get_scales, get_data_scales, geom_half_size, PHI_SCALE,
+                                          BulkSampler, periodic_lengths)
 from pytorch_utilities import NNCreator
 
 ''' Data-driven fit of the LBPM Peng-Robinson run (lbpm_bubble_dataset_newrun_nowrap.h5)
@@ -31,6 +32,11 @@ with the 3D geometric constraint; pytorch_3d_lbpm_train.py with the PDE part rem
     loss      MSE on each output against the CFD + periodic pairing of all three outputs
               on the x, y and z faces + the geometric loss of
               pytorch_3d_rising_bubble_train_geom.py, unchanged, on a = clip(rho_hat, 0, 1)
+    network   x, y, z enter through a sin/cos embedding with the box as period, so every
+              output is exactly periodic: the pairing loss is ~0 by construction (kept as a
+              check) and the geometric cubes that stick out of the box see wrapped values
+    points    near-interface DATA points are fixed; the bulk ones are redrawn every epoch
+              (BulkSampler), so no thin feature can hide between a fixed set of points
 
 No PDE, initial condition or pressure gauge: p is fitted as the absolute P_PR(rho). '''
 
@@ -275,8 +281,12 @@ def main():
 
     # (near-interface, domain) data points per training snapshot. Domain was 2700 (the
     # A + PDE budget of pytorch_3d_lbpm_train.py); at ~1 point per 500 carrier cells the
-    # net grew an unsampled 1-2 cell sheet with rho < 0 in run Oct-26-2026_02-00-01.
-    NOP_data = (3600, 10800)
+    # net grew an unsampled 1-2 cell sheet with rho < 0 in run Oct-26-2026_02-00-01. At
+    # 10800 fixed points it was still there (Oct-26-2026_06-37-38): a plane < 0.15 cells
+    # thick that none of the fixed points touched. The domain points are now redrawn
+    # every epoch by BulkSampler, NOP_bulk per snapshot, anywhere 4+ cells off the surface.
+    NOP_data = (3600, 0)
+    NOP_bulk = 10800
     NOP_NS = (20, 20)
     NOP_east = (20, 20)
     NOP_west = (20, 20)
@@ -287,6 +297,12 @@ def main():
         scales = get_scales()
         data_scales = get_data_scales()
         training_data = get_training_data_3d(NOP_data, NOP_NS, NOP_east, NOP_west, NOP_front_back)
+        bulk_sampler = BulkSampler(NOP_bulk)
+        periods = periodic_lengths()
+    near_data = training_data["DATA"]
+    # A first bulk draw, for the batch sizes and the final evaluation; each epoch redraws it.
+    training_data["DATA"] = pd.concat([near_data, bulk_sampler.sample(np.random.default_rng([1234]))],
+                                      ignore_index=True)
     logger.info(f"Training data: {os.path.abspath(generate_points_3d_lbpm_data.H5_PATH)}")
     logger.info(f"Normalisation: rho1 = {scales['rho1']:.5f}, rho2 = {scales['rho2']:.5f}, "
                 f"phi / {PHI_SCALE:g} cells, p in [{data_scales['p_min']:.6g}, {data_scales['p_max']:.6g}], "
@@ -302,12 +318,15 @@ def main():
     activation_functions_dict = build_activation_dict(hidden_layers, activation_functions, adaptive_activation_n)
 
     logger.info(f"Configuration: Activation='{activation_choice}', Mode='{adaptive_mode}'")
+    logger.info(f"Periodic embedding of x, y, z with periods {np.round(periods, 4)} (nondim); "
+                f"bulk DATA points: {NOP_bulk} per snapshot, redrawn every epoch")
 
     # Linear heads: rho_hat overshoots [0, 1] slightly, phi_hat spans [-1, 1].
     output_layer = [("output_rho", None), ("output_phi", None), ("output_p", None)]
 
     nn_creator = NNCreator(torch.float32)
-    net = nn_creator.get_model_dnn(4, hidden_layers, output_layer, activation_functions_dict, False)
+    net = nn_creator.get_model_dnn(4, hidden_layers, output_layer, activation_functions_dict, False,
+                                   periodic_lengths=periods)
     net.to(device)
 
     if is_distributed:
@@ -356,10 +375,13 @@ def main():
 
         for epoch in range(1, epochs + 1):
             epoch_losses = []
-            # Same permutation on every rank (seeded by phase and epoch), different batches.
+            # Same bulk points and permutation on every rank (seeded by phase and epoch),
+            # different batches.
             rng = np.random.default_rng([1234, i, epoch])
+            epoch_data = dict(training_data, DATA=pd.concat([near_data, bulk_sampler.sample(rng)],
+                                                            ignore_index=True))
             shuffled_data = {key: df.sample(frac=1, random_state=rng).reset_index(drop=True)
-                             for key, df in training_data.items()}
+                             for key, df in epoch_data.items()}
 
             # No skipping of empty batches here: a rank that skips a step deadlocks the rest.
             # slice_batch splits every set evenly, so no batch is empty anyway.
