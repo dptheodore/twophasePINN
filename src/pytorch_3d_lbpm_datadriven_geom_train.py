@@ -273,9 +273,10 @@ def main():
     if not is_main:
         logger.setLevel(logging.WARNING)  # rank 0 reports the all-reduced losses for everyone
 
-    # (near-interface, domain) data points per training snapshot: the A + PDE budget of
-    # pytorch_3d_lbpm_train.py (900 + 5400), all spent on data
-    NOP_data = (3600, 2700)
+    # (near-interface, domain) data points per training snapshot. Domain was 2700 (the
+    # A + PDE budget of pytorch_3d_lbpm_train.py); at ~1 point per 500 carrier cells the
+    # net grew an unsampled 1-2 cell sheet with rho < 0 in run Oct-26-2026_02-00-01.
+    NOP_data = (3600, 10800)
     NOP_NS = (20, 20)
     NOP_east = (20, 20)
     NOP_west = (20, 20)
