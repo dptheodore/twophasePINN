@@ -27,9 +27,10 @@ from pytorch_utilities import NNCreator
 pytorch_3d_lbpm_datadriven_geom_train.py without the geometric constraint.
 
     inputs    x, y, z, t   (cells / L_ref, (t - 19600) / T_ref)
-    outputs   rho_hat, phi_hat, p_hat, all linear heads (the targets and their
-              normalisation are in generate_points_3d_lbpm_data.py)
-    loss      MSE on each output against the CFD + periodic pairing of all three outputs
+    outputs   rho_hat, phi_hat, p_hat, u_hat, v_hat, w_hat, all linear heads (the targets
+              and their normalisation are in generate_points_3d_lbpm_data.py; the velocity
+              is the h5 velocity + F/(2 rho), min-max normalised per component)
+    loss      MSE on each output against the CFD + periodic pairing of all six outputs
               on the x, y and z faces
     network   x, y, z enter through a sin/cos embedding with the box as period, so every
               output is exactly periodic: the pairing loss is ~0 by construction (kept as a
@@ -65,42 +66,48 @@ def phase_fraction(rho_hat):
 
 
 def periodic_pair_loss(model, x1, y1, z1, x2, y2, z2, t):
-    """Sum over rho_hat, phi_hat, p_hat of the mismatch between two opposite faces at equal time."""
+    """Sum over all outputs of the mismatch between two opposite faces at equal time."""
     pred_1 = model(torch.cat([x1, y1, z1, t], dim=1))
     pred_2 = model(torch.cat([x2, y2, z2, t], dim=1))
-    return sum(torch.mean((pred_1[k] - pred_2[k]) ** 2) for k in range(3))
+    return sum(torch.mean((a - b) ** 2) for a, b in zip(pred_1, pred_2))
 
 
 def compute_loss(model, data_D, data_EW, data_FB, data_NS):
-    x, y, z, t, rho_gt, phi_gt, p_gt = data_D
+    x, y, z, t, rho_gt, phi_gt, p_gt, u_gt, v_gt, w_gt = data_D
 
     # Loss DATA (the CFD fields)
-    pred_rho, pred_phi, pred_p = model(torch.cat([x, y, z, t], dim=1))
+    pred_rho, pred_phi, pred_p, pred_u, pred_v, pred_w = model(torch.cat([x, y, z, t], dim=1))
     loss_rho = torch.mean((rho_gt - pred_rho) ** 2)
     loss_phi = torch.mean((phi_gt - pred_phi) ** 2)
     loss_p = torch.mean((p_gt - pred_p) ** 2)
+    loss_u = torch.mean((u_gt - pred_u) ** 2)
+    loss_v = torch.mean((v_gt - pred_v) ** 2)
+    loss_w = torch.mean((w_gt - pred_w) ** 2)
 
     # Periodic pairing on all three axes
     loss_BC = periodic_pair_loss(model, *data_EW) + periodic_pair_loss(model, *data_FB) + \
               periodic_pair_loss(model, *data_NS)
 
-    total_loss = loss_rho + loss_phi + loss_p + loss_BC
+    total_loss = loss_rho + loss_phi + loss_p + loss_u + loss_v + loss_w + loss_BC
 
-    return total_loss, loss_rho, loss_phi, loss_p, loss_BC
+    return total_loss, loss_rho, loss_phi, loss_p, loss_u, loss_v, loss_w, loss_BC
 
 
-VALIDATION_COLUMNS = ["mse_a", "rel_l2_rho", "rel_l2_phi_band", "rel_l2_p"]
+VALIDATION_COLUMNS = ["mse_a", "rel_l2_rho", "rel_l2_phi_band", "rel_l2_p",
+                      "rel_l2_u", "rel_l2_v", "rel_l2_w", "rel_l2_w_relative"]
 
 
 def evaluate_validation(net, val, scales, data_scales, chunk=20000):
     """Compares the network with the CFD on the held-out validation snapshots, in physical
-    (lattice) units: MSE of a, relative L2 errors of rho and p, and of the levelset inside
-    its band (|levelset| < 8 cells; outside it the CFD levelset is the clip value)."""
+    (lattice) units: MSE of a, relative L2 errors of rho, p, u, v and w, and of the
+    levelset inside its band (|levelset| < 8 cells; outside it the CFD levelset is the clip
+    value). w is dominated by the bulk drift, so rel_l2_w_relative compares w minus its
+    per-snapshot mean (over the validation points), i.e. the flow relative to the drift."""
     preds = []
     with torch.no_grad():
         for s in range(0, len(val["xyzt"]), chunk):
             preds.append(torch.cat(net(val["xyzt"][s:s + chunk]), dim=1))
-    rho_hat, phi_hat, p_hat = torch.cat(preds).T
+    rho_hat, phi_hat, p_hat, u_hat, v_hat, w_hat = torch.cat(preds).T
     ref = val["targets"]
     band = val["band"]
     drho = scales["rho1"] - scales["rho2"]
@@ -109,10 +116,25 @@ def evaluate_validation(net, val, scales, data_scales, chunk=20000):
     def rel_l2(pred, true):
         return (torch.linalg.norm(pred - true) / torch.linalg.norm(true)).item()
 
+    def velocity(c, hat):
+        return data_scales[f"{c}_min"] + (data_scales[f"{c}_max"] - data_scales[f"{c}_min"]) * hat
+
+    u_pred, v_pred, w_pred = (velocity(c, h) for c, h in zip("uvw", (u_hat, v_hat, w_hat)))
+    u_true, v_true, w_true = (velocity(c, ref[:, 5 + k]) for k, c in enumerate("uvw"))
+
+    t = val["xyzt"][:, 3]
+    w_pred_rel, w_true_rel = w_pred.clone(), w_true.clone()
+    for tv in torch.unique(t):
+        m = t == tv
+        w_pred_rel[m] -= w_pred[m].mean()
+        w_true_rel[m] -= w_true[m].mean()
+
     return dict(mse_a=torch.mean((phase_fraction(rho_hat) - ref[:, 3]) ** 2).item(),
                 rel_l2_rho=rel_l2(scales["rho2"] + drho * rho_hat, scales["rho2"] + drho * ref[:, 0]),
                 rel_l2_phi_band=rel_l2(phi_hat[band], ref[band, 1]),
-                rel_l2_p=rel_l2(data_scales["p_min"] + dp * p_hat, data_scales["p_min"] + dp * ref[:, 2]))
+                rel_l2_p=rel_l2(data_scales["p_min"] + dp * p_hat, data_scales["p_min"] + dp * ref[:, 2]),
+                rel_l2_u=rel_l2(u_pred, u_true), rel_l2_v=rel_l2(v_pred, v_true), rel_l2_w=rel_l2(w_pred, w_true),
+                rel_l2_w_relative=rel_l2(w_pred_rel, w_true_rel))
 
 
 def train_step(model, optimizer, batch):
@@ -240,13 +262,11 @@ def main():
     # Generation prints only from rank 0; the rest generate silently.
     with contextlib.redirect_stdout(sys.stdout if is_main else open(os.devnull, "w")):
         scales = get_scales()
-        data_scales = get_data_scales()
-        training_data = get_training_data_3d(NOP_data, NOP_NS, NOP_east, NOP_west, NOP_front_back)
-        bulk_sampler = BulkSampler(NOP_bulk)
+        data_scales = get_data_scales(velocity=True)
+        training_data = get_training_data_3d(NOP_data, NOP_NS, NOP_east, NOP_west, NOP_front_back,
+                                             velocity=True, geom=False)
+        bulk_sampler = BulkSampler(NOP_bulk, velocity=True)
         periods = periodic_lengths()
-    # The loader also reads the geometric regions; they are not used here, and dropping
-    # them keeps them out of the batch sizes.
-    training_data.pop("GEOM", None)
     near_data = training_data["DATA"]
     # A first bulk draw, for the batch sizes and the final evaluation; each epoch redraws it.
     training_data["DATA"] = pd.concat([near_data, bulk_sampler.sample(np.random.default_rng([1234]))],
@@ -255,6 +275,8 @@ def main():
     logger.info(f"Normalisation: rho1 = {scales['rho1']:.5f}, rho2 = {scales['rho2']:.5f}, "
                 f"phi / {PHI_SCALE:g} cells, p in [{data_scales['p_min']:.6g}, {data_scales['p_max']:.6g}], "
                 f"L_ref = {scales['L_ref']:.4f} cells, T_ref = {scales['T_ref']:.1f} steps")
+    logger.info("Velocity (h5 + F/(2 rho)) normalisation, lattice units: " +
+                ", ".join(f"{c} in [{data_scales[c + '_min']:.4g}, {data_scales[c + '_max']:.4g}]" for c in "uvw"))
 
     # --- NN Architecture and Hyperparameters --- #
     no_layers = 8
@@ -269,8 +291,9 @@ def main():
     logger.info(f"Periodic embedding of x, y, z with periods {np.round(periods, 4)} (nondim); "
                 f"bulk DATA points: {NOP_bulk} per snapshot, redrawn every epoch")
 
-    # Linear heads: rho_hat overshoots [0, 1] slightly, phi_hat spans [-1, 1].
-    output_layer = [("output_rho", None), ("output_phi", None), ("output_p", None)]
+    # Linear heads: rho_hat overshoots [0, 1] slightly, phi_hat spans [-1, 1], the rest [0, 1].
+    output_layer = [("output_rho", None), ("output_phi", None), ("output_p", None),
+                    ("output_u", None), ("output_v", None), ("output_w", None)]
 
     nn_creator = NNCreator(torch.float32)
     net = nn_creator.get_model_dnn(4, hidden_layers, output_layer, activation_functions_dict, False,
@@ -298,7 +321,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rates[0], eps=1e-8)
 
     start_total = time.time()
-    loss_names = ["rho", "phi", "p", "BC"]
+    loss_names = ["rho", "phi", "p", "u", "v", "w", "BC"]
     history = {k: [] for k in loss_names}
     current_best_total_loss = float('inf')
 
@@ -408,9 +431,10 @@ def main():
         # The 8 held-out snapshots, never used for training and only looked at here, once
         # training is done: (near-interface, anywhere) points per snapshot.
         NOP_validation = (2000, 8000)
-        val_df = get_validation_data_3d(NOP_validation)
+        val_df = get_validation_data_3d(NOP_validation, velocity=True)
         val = dict(xyzt=torch.tensor(val_df[["x", "y", "z", "t"]].to_numpy(), dtype=torch.float32, device=device),
-                   targets=torch.tensor(val_df[["rho_hat", "phi_hat", "p_hat", "a"]].to_numpy(),
+                   targets=torch.tensor(val_df[["rho_hat", "phi_hat", "p_hat", "a",
+                                                "band", "u_hat", "v_hat", "w_hat"]].to_numpy(),
                                         dtype=torch.float32, device=device),
                    band=torch.tensor(val_df["band"].to_numpy() > 0.5, device=device))
         val_steps = np.unique(np.round(val_df['t'].to_numpy() * scales["T_ref"] + scales["t_origin"]))
@@ -423,6 +447,10 @@ def main():
         logger.info(f"rel. L2 error rho          : {metrics['rel_l2_rho']:.4e}")
         logger.info(f"rel. L2 error phi (band)   : {metrics['rel_l2_phi_band']:.4e}")
         logger.info(f"rel. L2 error p            : {metrics['rel_l2_p']:.4e}")
+        logger.info(f"rel. L2 error u            : {metrics['rel_l2_u']:.4e}")
+        logger.info(f"rel. L2 error v            : {metrics['rel_l2_v']:.4e}")
+        logger.info(f"rel. L2 error w            : {metrics['rel_l2_w']:.4e}")
+        logger.info(f"rel. L2 error w - <w>      : {metrics['rel_l2_w_relative']:.4e}")
         logger.info("----------------------------\n")
 
         logger.info("Generating and saving loss history plots...")

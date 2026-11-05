@@ -6,6 +6,7 @@ from generate_points_3d import (get_points_for_interface_3d, get_points_for_doma
                                 compute_normals_3d, get_east_west, get_front_back)
 from generate_points_3d_lbpm import (H5_PATH, VAL_INDICES, BULK_LEVELSET, get_scales,
                                      interpolate_periodic, get_north_south, _cell_axes)
+import generate_points_3d_pr as pr
 
 ''' Data-driven points for pytorch_3d_lbpm_datadriven_geom_train.py on the LBPM file
 "lbpm_bubble_dataset_newrun_nowrap.h5": no PDE points, the CFD fields themselves as
@@ -21,6 +22,12 @@ Network outputs and their targets (all O(1)):
               the drop (the h5 sign), clipped at |phi_hat| = 1 by the h5 itself.
     p_hat     (p - p_min) / (p_max - p_min), p = h5 "pressure" = P_PR(rho) (to 2e-8),
               p_min/p_max over the training snapshots. No gauge: p is absolute.
+    u_hat,    only with velocity=True (pytorch_3d_lbpm_datadriven_train.py):
+    v_hat,    (u - u_min) / (u_max - u_min) per component, u = h5 velocity + F/(2 rho)
+    w_hat     (Guo half-force, pr.lbpm_force), min/max over the training snapshots. The
+              raw h5 velocity is the pre-forcing moment: its |u| ~ 0.9 U_ref is a frozen
+              parasitic shell at the interface; corrected, u and v are ~ +-0.013 U_ref and
+              w runs 0 -> 0.4 U_ref (the bulk drift plus the relative flow).
 
 Coordinates as generate_points_3d_lbpm: cells centred on the box, / L_ref; t is
 (t - 19600) / T_ref. Training snapshots are those not in VAL_INDICES (19 of 27).
@@ -31,33 +38,59 @@ Frames returned by get_training_data_3d:
                                                  cells 4+ cells off it, per snapshot. The
                                                  trainer passes NOP[1] = 0 and draws those
                                                  every epoch from BulkSampler instead
+           (+ u_hat, v_hat, w_hat with velocity=True)
     EW, FB, NS                                   periodic face pairs, as the LBPM trainer
     GEOM   x_geom, y_geom, z_geom, t_geom,       region centres, nondimensional;
            grad_x, grad_y, grad_z                grad_vec / h^2 = face-MEAN differences
                                                  (minus - plus) of a, dimensionless '''
 
 PHI_SCALE = BULK_LEVELSET
+VELOCITY_NAMES = ("velocityX", "velocityY", "velocityZ")
+VELOCITY_COLUMNS = ["u_hat", "v_hat", "w_hat"]
+FIELD_COLUMNS = ["rho_hat", "phi_hat", "p_hat"]
 _DATA_SCALES = None
 
 
-def get_data_scales():
-    ''' Pressure normalisation over the training snapshots. Cached. '''
+def physical_velocity(data, i):
+    ''' [u, v, w] of snapshot i in lattice units, each (Z, Y, X): the h5 velocity plus
+    F/(2 rho), F the LBPM cp force at that snapshot's time. '''
+    rho = np.array(data["density"][i], dtype=float)
+    F = pr.lbpm_force(rho, float(data["time"][i]))
+    return [np.array(data[name][i], dtype=float) + 0.5 * F[k] / rho for k, name in enumerate(VELOCITY_NAMES)]
+
+
+def get_data_scales(velocity=False):
+    ''' Pressure normalisation over the training snapshots, plus u/v/w_min/max (corrected
+    velocity) with velocity=True; those are only computed when first asked for. Cached. '''
     global _DATA_SCALES
     if _DATA_SCALES is None:
         with h5py.File(H5_PATH, "r") as data:
             indices = np.setdiff1d(np.arange(len(data["time"])), VAL_INDICES)
             p = [np.array(data["pressure"][i], dtype=float) for i in indices]
         _DATA_SCALES = dict(p_min=float(min(q.min() for q in p)), p_max=float(max(q.max() for q in p)))
+    if velocity and "u_min" not in _DATA_SCALES:
+        lo, hi = [np.inf] * 3, [-np.inf] * 3
+        with h5py.File(H5_PATH, "r") as data:
+            for i in np.setdiff1d(np.arange(len(data["time"])), VAL_INDICES):
+                for k, v in enumerate(physical_velocity(data, i)):
+                    lo[k], hi[k] = min(lo[k], float(v.min())), max(hi[k], float(v.max()))
+        for k, c in enumerate("uvw"):
+            _DATA_SCALES[f"{c}_min"], _DATA_SCALES[f"{c}_max"] = lo[k], hi[k]
     return _DATA_SCALES
 
 
-def normalised_fields(data, i, scales, data_scales):
-    ''' (rho_hat, phi_hat, p_hat) of snapshot i, each (Z, Y, X). '''
+def normalised_fields(data, i, scales, data_scales, velocity=False):
+    ''' (rho_hat, phi_hat, p_hat) of snapshot i, each (Z, Y, X), followed by
+    (u_hat, v_hat, w_hat) with velocity=True. '''
     rho = np.array(data["density"][i], dtype=float)
     p = np.array(data["pressure"][i], dtype=float)
-    return ((rho - scales["rho2"]) / (scales["rho1"] - scales["rho2"]),
-            np.array(data["levelset"][i], dtype=float) / PHI_SCALE,
-            (p - data_scales["p_min"]) / (data_scales["p_max"] - data_scales["p_min"]))
+    fields = ((rho - scales["rho2"]) / (scales["rho1"] - scales["rho2"]),
+              np.array(data["levelset"][i], dtype=float) / PHI_SCALE,
+              (p - data_scales["p_min"]) / (data_scales["p_max"] - data_scales["p_min"]))
+    if velocity:
+        fields += tuple((v - data_scales[f"{c}_min"]) / (data_scales[f"{c}_max"] - data_scales[f"{c}_min"])
+                        for v, c in zip(physical_velocity(data, i), "uvw"))
+    return fields
 
 
 def geom_half_size():
@@ -79,17 +112,19 @@ class BulkSampler:
     surface, with the CFD fields interpolated periodically as targets. Replaces a fixed
     get_points_for_domain_3d set, between whose points the network grew a sub-cell plane
     with rho < 0 that no training point ever saw (runs Oct-26-2026_02-00-01, 06-37-38).
-    sample() draws everything from the rng it is given, so ranks seeded alike agree. '''
+    sample() draws everything from the rng it is given, so ranks seeded alike agree.
+    With velocity=True the targets also include u_hat, v_hat, w_hat. '''
 
-    def __init__(self, NOP, max_levelset=4.0):
-        scales, data_scales = get_scales(), get_data_scales()
+    def __init__(self, NOP, max_levelset=4.0, velocity=False):
+        scales, data_scales = get_scales(), get_data_scales(velocity)
         with h5py.File(H5_PATH, "r") as data:
             (self.X, self.Y, self.Z), sizes = _cell_axes(data)
             times = np.array(data["time"], dtype=float)
             indices = np.setdiff1d(np.arange(len(times)), VAL_INDICES)
-            # (snapshot, field, Z, Y, X), fields rho_hat, phi_hat, p_hat
-            self.fields = np.stack([np.stack(normalised_fields(data, i, scales, data_scales)).astype(np.float32)
-                                    for i in indices])
+            # (snapshot, field, Z, Y, X), fields rho_hat, phi_hat, p_hat[, u_hat, v_hat, w_hat]
+            self.fields = np.stack([np.stack(normalised_fields(data, i, scales, data_scales, velocity))
+                                    .astype(np.float32) for i in indices])
+        self.columns = FIELD_COLUMNS + (VELOCITY_COLUMNS if velocity else [])
         self.t = (times[indices] - scales["t_origin"]) / scales["T_ref"]
         self.size = np.array(sizes, dtype=float)
         self.lo = -self.size / 2
@@ -97,8 +132,8 @@ class BulkSampler:
         self.phi_cut = max_levelset / PHI_SCALE
 
     def _interpolate(self, k, pts):
-        """(n, 3) rho_hat, phi_hat, p_hat of snapshot k at pts: interpolate_periodic with the
-        trilinear weights shared by the three fields."""
+        """(n, n_fields) targets of snapshot k at pts: interpolate_periodic with the
+        trilinear weights shared by all the fields."""
         s = (pts - np.array([self.X[0], self.Y[0], self.Z[0]])).T
         base = np.floor(s).astype(int)
         frac = (s - base).astype(np.float32)
@@ -109,7 +144,7 @@ class BulkSampler:
                 for dx in (0, 1):
                     w = ((frac[0] if dx else 1 - frac[0]) * (frac[1] if dy else 1 - frac[1]) *
                          (frac[2] if dz else 1 - frac[2]))
-                    # the slice between the index arrays puts the points first: (n, 3)
+                    # the slice between the index arrays puts the points first: (n, n_fields)
                     out = out + w[:, None] * self.fields[k, :, (base[2] + dz) % nz, (base[1] + dy) % ny, (base[0] + dx) % nx]
         return out
 
@@ -125,7 +160,7 @@ class BulkSampler:
                 n += far.sum()
             rows = np.vstack(kept)[:self.NOP]
             blocks.append(np.column_stack([rows[:, :3] / self.L_ref, np.full(self.NOP, t), rows[:, 3:]]))
-        return pd.DataFrame(np.vstack(blocks), columns=["x", "y", "z", "t", "rho_hat", "phi_hat", "p_hat"])
+        return pd.DataFrame(np.vstack(blocks), columns=["x", "y", "z", "t"] + self.columns)
 
 
 def get_geom_data_3d():
@@ -143,16 +178,18 @@ def get_geom_data_3d():
                          "grad_x": grad_vec[:, 0], "grad_y": grad_vec[:, 1], "grad_z": grad_vec[:, 2]})
 
 
-def get_training_data_3d(NOP_data, NOP_NS, NOP_east, NOP_west, NOP_front_back):
+def get_training_data_3d(NOP_data, NOP_NS, NOP_east, NOP_west, NOP_front_back, velocity=False, geom=True):
+    ''' velocity=True adds the u_hat, v_hat, w_hat targets to DATA; geom=False leaves out
+    the GEOM frame (and so does not need computation_regions in the h5). '''
     scales = get_scales()
-    data_scales = get_data_scales()
+    data_scales = get_data_scales(velocity)
     L_ref, T_ref = scales["L_ref"], scales["T_ref"]
     with h5py.File(H5_PATH, "r") as data:
         (X, Y, Z), (nx, ny, nz) = _cell_axes(data)
         times_all = np.array(data["time"], dtype=float)
         indices = np.setdiff1d(np.arange(len(times_all)), VAL_INDICES)
         levelset = -np.array(data["levelset"][indices], dtype=float)      # drop positive
-        fields = [normalised_fields(data, i, scales, data_scales) for i in indices]
+        fields = [normalised_fields(data, i, scales, data_scales, velocity) for i in indices]
     times = times_all[indices] - scales["t_origin"]
 
     x_bounds, y_bounds, z_bounds = [-nx / 2, nx / 2], [-ny / 2, ny / 2], [-nz / 2, nz / 2]
@@ -191,28 +228,31 @@ def get_training_data_3d(NOP_data, NOP_NS, NOP_east, NOP_west, NOP_front_back):
 
     print("Assembling data frames\n")
     frames = dict(
-        DATA=pd.DataFrame(data_D, columns=["x", "y", "z", "t", "rho_hat", "phi_hat", "p_hat"]),
+        DATA=pd.DataFrame(data_D, columns=["x", "y", "z", "t"] + FIELD_COLUMNS +
+                                          (VELOCITY_COLUMNS if velocity else [])),
         EW=pd.DataFrame(np.hstack([data_east[:, 0:3], data_west[:, 0:4]]),
                         columns=["x_E", "y_E", "z_E", "x_W", "y_W", "z_W", "t_EW"]),
         FB=pd.DataFrame(np.hstack([data_front[:, 0:3], data_back[:, 0:4]]),
                         columns=["x_F", "y_F", "z_F", "x_B", "y_B", "z_B", "t_FB"]),
         NS=pd.DataFrame(np.hstack([data_n[:, 0:3], data_s[:, 0:4]]),
                         columns=["x_Nz", "y_Nz", "z_Nz", "x_Sz", "y_Sz", "z_Sz", "t_NS"]),
-        GEOM=get_geom_data_3d(),
     )
+    if not geom:
+        return frames
+    frames["GEOM"] = get_geom_data_3d()
     t_train = np.unique(np.round(frames["DATA"]["t"].to_numpy(), 6))
     t_geom = np.unique(np.round(frames["GEOM"]["t_geom"].to_numpy(), 6))
     assert np.allclose(t_train, t_geom), "computation_regions snapshots differ from the training snapshots"
     return frames
 
 
-def get_validation_data_3d(NOP, seed=4321):
+def get_validation_data_3d(NOP, seed=4321, velocity=False):
     ''' Samples the VAL_INDICES snapshots at cell centres: per snapshot NOP[0] cells within
     4 cells of the interface and NOP[1] cells anywhere. Columns x, y, z, t, rho_hat,
-    phi_hat, p_hat, a, band; band = 1 inside the levelset band (|levelset| < 8), where
-    phi is a distance rather than the clip value. '''
+    phi_hat, p_hat, a, band (+ u_hat, v_hat, w_hat with velocity=True); band = 1 inside
+    the levelset band (|levelset| < 8), where phi is a distance rather than the clip value. '''
     scales = get_scales()
-    data_scales = get_data_scales()
+    data_scales = get_data_scales(velocity)
     L_ref, T_ref = scales["L_ref"], scales["T_ref"]
     rng = np.random.default_rng(seed)
     rows = []
@@ -220,7 +260,7 @@ def get_validation_data_3d(NOP, seed=4321):
         (X, Y, Z), _ = _cell_axes(data)
         times = np.array(data["time"], dtype=float)
         for i in VAL_INDICES:
-            rho_hat, phi_hat, p_hat = normalised_fields(data, i, scales, data_scales)
+            rho_hat, phi_hat, p_hat, *vel_hat = normalised_fields(data, i, scales, data_scales, velocity)
             levelset = phi_hat * PHI_SCALE
             near = np.flatnonzero(np.abs(levelset) <= 4)
             flat = np.concatenate([rng.choice(near, NOP[0], replace=False),
@@ -231,6 +271,8 @@ def get_validation_data_3d(NOP, seed=4321):
                 np.full(len(flat), (times[i] - scales["t_origin"]) / T_ref),
                 rho_hat.ravel()[flat], phi_hat.ravel()[flat], p_hat.ravel()[flat],
                 np.clip(rho_hat.ravel()[flat], 0.0, 1.0),
-                (np.abs(levelset.ravel()[flat]) < BULK_LEVELSET).astype(float)]))
+                (np.abs(levelset.ravel()[flat]) < BULK_LEVELSET).astype(float),
+                *(v.ravel()[flat] for v in vel_hat)]))
     print(f"Validation points: {sum(NOP)} per snapshot at t = {times[VAL_INDICES].astype(int)}")
-    return pd.DataFrame(np.vstack(rows), columns=["x", "y", "z", "t", "rho_hat", "phi_hat", "p_hat", "a", "band"])
+    return pd.DataFrame(np.vstack(rows), columns=["x", "y", "z", "t", "rho_hat", "phi_hat", "p_hat", "a", "band"] +
+                                                 (VELOCITY_COLUMNS if velocity else []))
