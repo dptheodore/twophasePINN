@@ -56,7 +56,7 @@ mean over the top cell layer is p* = 1.
 Snapshots: VAL_INDICES (every third from the third, 8 of 27) are held out for validation;
 the other 19, including the first and last, are training snapshots. '''
 
-H5_PATH = "../cfd_data/lbpm_bubble_dataset_newrun_nowrap.h5"
+H5_PATH = "../cfd_data/new_lbpm.h5"
 VAL_INDICES = np.arange(2, 26, 3)
 BULK_LEVELSET = 8.0          # |levelset| is clipped at 8 cells; == 8 means outside the band
 
