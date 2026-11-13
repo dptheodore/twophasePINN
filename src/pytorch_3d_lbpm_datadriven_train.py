@@ -312,7 +312,7 @@ def main():
     # process). Each DDP step consumes one batch per rank, so the data is split into
     # steps_per_epoch * world_size batches; every rank takes the same number of steps
     # (unequal counts deadlock DDP's all-reduce).
-    steps_per_epoch = 4
+    steps_per_epoch = 2
     num_of_batches = steps_per_epoch * world_size
 
     num_samples_total = sum(len(df) for df in training_data.values())
